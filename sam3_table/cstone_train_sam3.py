@@ -10,7 +10,7 @@ image = (
     .apt_install("git")
     .pip_install_from_requirements("requirements.txt")
     .pip_install("triton")
-    .add_local_python_source("sam3_train")
+    .add_local_python_source("sam3_table")
 )
 
 app = modal.App(name="training-sam3", image = image)
@@ -21,7 +21,9 @@ def train_sam3(
     device: list[int] | None = None,
 ) -> None:
 
-    from train_sam3_lora_native import SAM3TrainerNative
+    #from train_sam3_lora_native import SAM3TrainerNative
+    from sam3_table.train_sam3_lora_native import SAM3TrainerNative
+
     
 
     if device is None:
