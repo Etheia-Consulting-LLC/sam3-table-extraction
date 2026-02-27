@@ -48,9 +48,9 @@ from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
 from sam3.model.box_ops import box_xywh_to_xyxy
-from lora_layers import LoRAConfig as LoRALayerConfig, apply_lora_to_model, save_lora_weights, count_parameters
-from training_config import SAM3LoRAConfig, DatasetSplit
-from coco_schema import COCODataset, RLESegmentation
+from sam3_table.lora_layers import LoRAConfig as LoRALayerConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from sam3_table.training_config import SAM3LoRAConfig, DatasetSplit
+from sam3_table.coco_schema import COCODataset, RLESegmentation
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
