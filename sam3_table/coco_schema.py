@@ -20,8 +20,15 @@ class COCOImage(BaseModel):
 class RLESegmentation(BaseModel):
     """Run-length encoded segmentation mask."""
 
-    counts: str
+    counts: str | list[int]
     size: list[int] = Field(min_length=2, max_length=2)
+
+    @field_validator("counts")
+    @classmethod
+    def counts_must_be_string_or_int_list(cls, v: str | list[int]) -> str | list[int]:
+        if isinstance(v, list) and not all(isinstance(x, int) for x in v):
+            raise ValueError("RLE counts list must contain only integers")
+        return v
 
 
 class COCOAnnotation(BaseModel):
@@ -29,7 +36,7 @@ class COCOAnnotation(BaseModel):
 
     Segmentation can be:
       - polygon format:  list of coordinate lists  [[x1, y1, x2, y2, ...], ...]
-      - RLE format:      {"counts": "...", "size": [h, w]}
+      - RLE format:      {"counts": "...", "size": [h, w]} or {"counts": [1, 2, ...], "size": [h, w]}
       - absent:          None (bbox-only annotation)
     """
 

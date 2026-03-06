@@ -1,4 +1,4 @@
-"""Golden tests for COCODataset schema parsed from testSamples/ex_annotations.coco.json."""
+"""Golden tests for COCODataset schema parsed from small_coco/instances_train2017_small.json."""
 
 from pathlib import Path
 
@@ -13,7 +13,7 @@ from coco_schema import (
     RLESegmentation,
 )
 
-SAMPLE_JSON = Path(__file__).parent / "testSamples" / "ex_annotations.coco.json"
+SAMPLE_JSON = Path(__file__).parent / "small_coco" / "instances_train2017_small.json"
 
 
 @pytest.fixture

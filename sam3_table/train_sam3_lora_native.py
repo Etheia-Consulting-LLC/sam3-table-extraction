@@ -111,14 +111,9 @@ def print_rank0(*args, **kwargs):
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data."""
 
-    def __init__(self, split_config: DatasetSplit):
-        self.image_dir = split_config.image_dir
-        ann_file = split_config.annotation_file
-
-        if not ann_file.exists():
-            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
-
-        self.coco_data = COCODataset.from_json(ann_file)
+    def __init__(self, coco_dataset: COCODataset, image_dir: Path | None = None):
+        self.coco_data = coco_dataset
+        self.image_dir = image_dir
 
         # Build index: image_id -> image info
         self.images = {img.id: img for img in self.coco_data.images}
@@ -133,7 +128,10 @@ class COCOSegmentDataset(Dataset):
 
         # Load categories
         self.categories = {cat.id: cat.name for cat in self.coco_data.categories}
-        print(f"Loaded COCO dataset from {self.image_dir}")
+        if self.image_dir is not None:
+            print(f"Loaded COCO dataset from {self.image_dir}")
+        else:
+            print("Loaded COCO dataset from passed object")
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data.annotations)}")
         print(f"  Categories: {self.categories}")
@@ -148,12 +146,30 @@ class COCOSegmentDataset(Dataset):
     def __len__(self):
         return len(self.image_ids)
 
+    @classmethod
+    def from_split_config(cls, split_config: DatasetSplit) -> "COCOSegmentDataset":
+        ann_file = split_config.annotation_file
+        if not ann_file.exists():
+            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
+        return cls(
+            COCODataset.from_json(ann_file),
+            image_dir=split_config.image_dir,
+        )
+
+    def _resolve_image_path(self, file_name: str) -> Path:
+        image_path = Path(file_name)
+        if image_path.is_absolute():
+            return image_path
+        if self.image_dir is not None:
+            return self.image_dir / image_path
+        return Path("/data") / image_path
+
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
         img_info = self.images[img_id]
 
         # Load image
-        img_path = self.image_dir / img_info.file_name
+        img_path = self._resolve_image_path(img_info.file_name)
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
@@ -744,11 +760,22 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
 
 class SAM3TrainerNative:
-    def __init__(self, config: "SAM3LoRAConfig | str | Path", multi_gpu=False):
+    def __init__(
+        self,
+        config: "SAM3LoRAConfig | str | Path",
+        train_coco_dataset: COCODataset | None = None,
+        val_coco_dataset: COCODataset | None = None,
+        test_coco_dataset: COCODataset | None = None,
+        multi_gpu=False,
+    ):
         if isinstance(config, (str, Path)):
             self.config = SAM3LoRAConfig.from_yaml(config)
         else:
             self.config = config
+
+        self.train_coco_dataset = train_coco_dataset
+        self.val_coco_dataset = val_coco_dataset
+        self.test_coco_dataset = test_coco_dataset
 
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
@@ -871,28 +898,27 @@ class SAM3TrainerNative:
         
     def train(self):
         train_cfg = self.config.training
-        data_cfg = train_cfg.data
 
-        # Load training dataset
-        print_rank0(f"\nLoading training data from {data_cfg.train.image_dir}...")
-        train_ds = COCOSegmentDataset(data_cfg.train)
+        if self.train_coco_dataset is None:
+            raise ValueError(
+                "Training requires train_coco_dataset; config-based train loading is disabled."
+            )
 
-        # Load validation dataset (if configured)
+        # Load training dataset from the passed COCO object only.
+        print_rank0("\nLoading training data from passed train_coco_dataset...")
+        train_ds = COCOSegmentDataset(self.train_coco_dataset)
+
         has_validation = False
         val_ds = None
 
-        if data_cfg.valid is not None:
-            try:
-                print_rank0(f"\nLoading validation data from {data_cfg.valid.image_dir}...")
-                val_ds = COCOSegmentDataset(data_cfg.valid)
-                if len(val_ds) > 0:
-                    has_validation = True
-                    print_rank0(f"Found validation data: {len(val_ds)} images")
-                else:
-                    print_rank0("Validation dataset is empty.")
-                    val_ds = None
-            except Exception as e:
-                print_rank0(f"Could not load validation data: {e}")
+        if self.val_coco_dataset is not None:
+            print_rank0("\nLoading validation data from passed val_coco_dataset...")
+            val_ds = COCOSegmentDataset(self.val_coco_dataset)
+            if len(val_ds) > 0:
+                has_validation = True
+                print_rank0(f"Found validation data: {len(val_ds)} images")
+            else:
+                print_rank0("Validation dataset is empty.")
                 val_ds = None
 
         def collate_fn(batch):
