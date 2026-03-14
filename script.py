@@ -17,16 +17,16 @@ if __name__ == "__main__":
     path = Path(__file__).resolve().parent / "sam3_table" / "testSamples" / "full_lora_config.yaml"
     config = SAM3LoRAConfig.from_yaml(path)
 
-    coco_path = Path(__file__).resolve().parent / "sam3_table" / "small_coco" / "instances_train2017_small.json"
+    coco_path = Path(__file__).resolve().parent / "sam3_table" / "table_dataset" / "annotations.json"
     train_coco_dataset = load_coco_dataset(str(coco_path))
     val_coco_dataset = load_coco_dataset(str(coco_path))
     test_coco_dataset = load_coco_dataset(str(coco_path))
-    #upload_image_directory("sam3_table/small_coco")
+    upload_image_directory("sam3_table/table_dataset/images")
 
     with app.run():
         print(
             train_sam3.remote(
-                config,
+                config.model_dump(mode="json"),
                 train_coco_dataset=train_coco_dataset,
                 val_coco_dataset=val_coco_dataset,
                 test_coco_dataset=test_coco_dataset,
