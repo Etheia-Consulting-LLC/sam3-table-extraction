@@ -159,6 +159,7 @@ def infer_sam3(
     )
     from sam3_table.train_sam3_lora_native import (
         convert_predictions_to_coco_format_original_res,
+        resolve_bpe_vocab_path,
     )
 
     if not image_bytes_list:
@@ -255,7 +256,7 @@ def infer_sam3(
         device=device_obj.type,
         compile=False,
         load_from_HF=True,
-        bpe_path=None,
+        bpe_path=resolve_bpe_vocab_path(),
         eval_mode=True,
     )
     lora_cfg = config.lora

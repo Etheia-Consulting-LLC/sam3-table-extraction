@@ -21,7 +21,7 @@ if __name__ == "__main__":
     train_coco_dataset = load_coco_dataset(str(coco_path))
     val_coco_dataset = load_coco_dataset(str(coco_path))
     test_coco_dataset = load_coco_dataset(str(coco_path))
-    upload_image_directory("sam3_table/table_dataset/images")
+    #upload_image_directory("sam3_table/table_dataset/images")
 
     with app.run():
         print(

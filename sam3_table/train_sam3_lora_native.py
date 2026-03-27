@@ -24,6 +24,7 @@ Multi-GPU Training:
 import os
 import argparse
 import json
+import urllib.request
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -58,6 +59,10 @@ from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 
 # Note: Evaluation modules (mAP, cgF1, NMS) are in validate_sam3_lora.py
 # Training only computes validation loss, following SAM3's approach
+
+
+BPE_VOCAB_URL = "https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz"
+BPE_CACHE_PATH = Path("/tmp/bpe_simple_vocab_16e6.txt.gz")
 
 
 # ============================================================================
@@ -106,6 +111,21 @@ def print_rank0(*args, **kwargs):
     """Print only on rank 0."""
     if is_main_process():
         print(*args, **kwargs)
+
+
+def resolve_bpe_vocab_path() -> str:
+    """Return a valid local path to the CLIP BPE vocab required by SAM3."""
+    env_path = os.environ.get("SAM3_BPE_PATH")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    if BPE_CACHE_PATH.exists():
+        return str(BPE_CACHE_PATH)
+
+    BPE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    print_rank0(f"Downloading SAM3 BPE vocab to {BPE_CACHE_PATH}...")
+    urllib.request.urlretrieve(BPE_VOCAB_URL, BPE_CACHE_PATH)
+    return str(BPE_CACHE_PATH)
 
 
 class COCOSegmentDataset(Dataset):
@@ -797,7 +817,7 @@ class SAM3TrainerNative:
             device=self.device.type,
             compile=False,
             load_from_HF=True,
-            bpe_path=None,
+            bpe_path=resolve_bpe_vocab_path(),
             eval_mode=False
         )
 
