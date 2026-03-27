@@ -69,7 +69,7 @@ training:
     valid:
       image_dir: "/workspace/data/valid"
       annotation_file: "/workspace/data/valid/_annotations.coco.json"
-  batch_size: 4      # Increased from 1 to reduce gradient variance
+  batch_size: 1      # Increased from 1 to reduce gradient variance
   num_workers: 2        # Increase for better data loading
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
@@ -79,7 +79,7 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
+  num_epochs: 3 # 100 is default       # Reduced from 500 (small dataset overfits quickly)
   warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
   lr_scheduler: "cosine"
 

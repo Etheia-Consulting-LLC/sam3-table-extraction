@@ -215,8 +215,9 @@ class COCOSegmentDataset(Dataset):
             if segmentation is not None:
                 try:
                     if isinstance(segmentation, RLESegmentation):
-                        # RLE format: {"counts": "...", "size": [h, w]}
                         rle_dict = {"counts": segmentation.counts, "size": segmentation.size}
+                        if isinstance(segmentation.counts, list):
+                            rle_dict = mask_utils.frPyObjects(rle_dict, segmentation.size[0], segmentation.size[1])
                         mask_np = mask_utils.decode(rle_dict)
                     else:
                         # Polygon format: [[x1, y1, x2, y2, ...], ...]

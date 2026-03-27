@@ -18,35 +18,40 @@ image = (
 
 app = modal.App(name="training-sam3", image = image)
 
-vol = modal.Volume.from_name("my-volume", create_if_missing=True)
-MODAL_DATA_DIR = Path("/data")
-LOCAL_IMAGE_DIR = Path(__file__).resolve().parent / "small_coco" / "train_2017_small"
+data_vol = modal.Volume.from_name("data-vol", create_if_missing=True)
+artifacts_vol = modal.Volume.from_name("artifacts-vol", create_if_missing=True)
+
+MODAL_DATA_DIR = "/data"
+MODAL_ARTIFACTS_DIR = "/artifacts"
+LOCAL_IMAGE_DIR = Path(__file__).resolve().parent / "table_dataset" / "images"
 
 
 def upload_image_directory(local_image_dir: str | Path = LOCAL_IMAGE_DIR) -> None:
     """Upload the local training image directory into the mounted Modal volume."""
     local_image_dir = Path(local_image_dir)
-    with vol.batch_upload() as batch:
+    with data_vol.batch_upload() as batch:
         batch.put_directory(str(local_image_dir), "/")
 
 
 @app.function(
-    gpu="A100",
+    gpu="H200",
     image=image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    volumes={str(MODAL_DATA_DIR): vol},
+    volumes={MODAL_DATA_DIR: data_vol, MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=3600,
 )
 def train_sam3(
-    config: SAM3LoRAConfig,
+    config_dict: dict,
     train_coco_dataset: COCODataset | None = None,
     val_coco_dataset: COCODataset | None = None,
     test_coco_dataset: COCODataset | None = None,
     device: list[int] | None = None,
-    
 ) -> None:
 
-    #from train_sam3_lora_native import SAM3TrainerNative
     from sam3_table.train_sam3_lora_native import SAM3TrainerNative
+
+    config = SAM3LoRAConfig.model_validate(config_dict)
+    config.output.output_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.output_dir}"
 
     if device is None:
         device = [0]
@@ -66,6 +71,5 @@ def train_sam3(
     )
     trainer.train()
 
-    
-
-    
+    artifacts_vol.commit()
+    print(f"Training artifacts committed to 'training-artifacts' volume.")
