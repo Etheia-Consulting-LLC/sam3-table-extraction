@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import modal
@@ -51,7 +52,11 @@ def train_sam3(
     from sam3_table.train_sam3_lora_native import SAM3TrainerNative
 
     config = SAM3LoRAConfig.model_validate(config_dict)
-    config.output.output_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.output_dir}"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    config.output.output_dir = (
+        f"{MODAL_ARTIFACTS_DIR}/{config.output.output_dir}/{timestamp}"
+    )
+    config.output.logging_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.logging_dir}/{timestamp}"
 
     if device is None:
         device = [0]
@@ -72,4 +77,4 @@ def train_sam3(
     trainer.train()
 
     artifacts_vol.commit()
-    print(f"Training artifacts committed to 'training-artifacts' volume.")
+    print(f"Training artifacts committed to 'artifacts-vol' at {config.output.output_dir}.")
