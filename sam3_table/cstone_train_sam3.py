@@ -21,19 +21,11 @@ image = (
 
 app = modal.App(name="training-sam3", image = image)
 
-data_vol = modal.Volume.from_name("data-vol", create_if_missing=True)
+data_vol = modal.Volume.from_name("pubtables-vol")
 artifacts_vol = modal.Volume.from_name("artifacts-vol", create_if_missing=True)
 
 MODAL_DATA_DIR = "/data"
 MODAL_ARTIFACTS_DIR = "/artifacts"
-LOCAL_IMAGE_DIR = Path(__file__).resolve().parent / "table_dataset" / "images"
-
-
-def upload_image_directory(local_image_dir: str | Path = LOCAL_IMAGE_DIR) -> None:
-    """Upload the local training image directory into the mounted Modal volume."""
-    local_image_dir = Path(local_image_dir)
-    with data_vol.batch_upload() as batch:
-        batch.put_directory(str(local_image_dir), "/")
 
 
 @app.function(
@@ -64,6 +56,17 @@ def train_sam3(
     (out_dir / "run_config.json").write_text(
         json.dumps(config.model_dump(mode="json"), indent=2)
     )
+
+    if train_coco_dataset is None:
+        print("Loading training annotations from pubtables-vol...")
+        train_ann = Path(config.training.data.train.annotation_file)
+        train_coco_dataset = COCODataset.from_json(train_ann)
+
+    if val_coco_dataset is None and config.training.data.valid is not None:
+        print("Loading validation annotations from pubtables-vol...")
+        val_ann = Path(config.training.data.valid.annotation_file)
+        if val_ann.exists():
+            val_coco_dataset = COCODataset.from_json(val_ann)
 
     if device is None:
         device = [0]

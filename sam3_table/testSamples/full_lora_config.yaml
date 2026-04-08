@@ -9,8 +9,8 @@ model:
 
 # LoRA settings
 lora:
-  rank: 32                   # Reduced from 64 to avoid OOM
-  alpha: 64                  # 2x rank (scaling factor)
+  rank: 8                   # Reduced from 64 to avoid OOM (OG 32)
+  alpha: 16                  # 2x rank (scaling factor)
   dropout: 0.1               # Some dropout for regularization
 
   # Target modules for SAM3 architecture
@@ -54,21 +54,22 @@ lora:
 
   # Apply LoRA to ALL components for maximum adaptation
   apply_to_vision_encoder: true    # Vision backbone (ViT)
-  apply_to_text_encoder: true      # Language backbone (CLIP text encoder)
-  apply_to_geometry_encoder: true  # Geometry encoder for prompts
-  apply_to_detr_encoder: true      # DETR-style transformer encoder
-  apply_to_detr_decoder: true      # DETR-style transformer decoder
-  apply_to_mask_decoder: true      # Mask prediction head
+  apply_to_text_encoder: false      # Language backbone (CLIP text encoder)
+  apply_to_geometry_encoder: false  # Geometry encoder for prompts
+  apply_to_detr_encoder: false      # DETR-style transformer encoder
+  apply_to_detr_decoder: false      # DETR-style transformer decoder
+  apply_to_mask_decoder: false      # Mask prediction head
 
 # Training settings
 training:
   data:
     train:
-      image_dir: "/workspace/data/train"
-      annotation_file: "/workspace/data/train/_annotations.coco.json"
+      image_dir: "/data/pubtables_v2_single_pages/train/images"
+      annotation_file: "/data/pubtables_v2_single_pages/train/_annotations.coco.json"
     valid:
-      image_dir: "/workspace/data/valid"
-      annotation_file: "/workspace/data/valid/_annotations.coco.json"
+      image_dir: "/data/pubtables_v2_single_pages/val/images"
+      annotation_file: "/data/pubtables_v2_single_pages/val/_annotations.coco.json"
+    sample_percent: 100.0  # Percentage of dataset to use (e.g. 10.0 = 10%)
   batch_size: 1      # Increased from 1 to reduce gradient variance
   num_workers: 2        # Increase for better data loading
 

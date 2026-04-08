@@ -131,13 +131,25 @@ def resolve_bpe_vocab_path() -> str:
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data."""
 
-    def __init__(self, coco_dataset: COCODataset, image_dir: Path | None = None):
+    def __init__(
+        self,
+        coco_dataset: COCODataset,
+        image_dir: Path | None = None,
+        sample_percent: float = 100.0,
+        seed: int = 42,
+    ):
         self.coco_data = coco_dataset
         self.image_dir = image_dir
 
         # Build index: image_id -> image info
         self.images = {img.id: img for img in self.coco_data.images}
         self.image_ids = sorted(self.images.keys())
+
+        if sample_percent < 100.0:
+            import random
+            rng = random.Random(seed)
+            k = max(1, int(len(self.image_ids) * sample_percent / 100.0))
+            self.image_ids = sorted(rng.sample(self.image_ids, k))
 
         # Build index: image_id -> list of annotations
         self.img_to_anns: dict[int, list] = {}
@@ -152,7 +164,9 @@ class COCOSegmentDataset(Dataset):
             print(f"Loaded COCO dataset from {self.image_dir}")
         else:
             print("Loaded COCO dataset from passed object")
-        print(f"  Images: {len(self.image_ids)}")
+        total_images = len(self.images)
+        used_images = len(self.image_ids)
+        print(f"  Images: {used_images}/{total_images} ({sample_percent:.1f}%)")
         print(f"  Annotations: {len(self.coco_data.annotations)}")
         print(f"  Categories: {self.categories}")
 
@@ -167,13 +181,20 @@ class COCOSegmentDataset(Dataset):
         return len(self.image_ids)
 
     @classmethod
-    def from_split_config(cls, split_config: DatasetSplit) -> "COCOSegmentDataset":
+    def from_split_config(
+        cls,
+        split_config: DatasetSplit,
+        sample_percent: float = 100.0,
+        seed: int = 42,
+    ) -> "COCOSegmentDataset":
         ann_file = split_config.annotation_file
         if not ann_file.exists():
             raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
         return cls(
             COCODataset.from_json(ann_file),
             image_dir=split_config.image_dir,
+            sample_percent=sample_percent,
+            seed=seed,
         )
 
     def _resolve_image_path(self, file_name: str) -> Path:
@@ -919,27 +940,53 @@ class SAM3TrainerNative:
         
     def train(self):
         train_cfg = self.config.training
+        sample_pct = train_cfg.data.sample_percent
+        seed = train_cfg.seed
 
-        if self.train_coco_dataset is None:
-            raise ValueError(
-                "Training requires train_coco_dataset; config-based train loading is disabled."
+        if self.train_coco_dataset is not None:
+            print_rank0("\nLoading training data from passed train_coco_dataset...")
+            train_image_dir = train_cfg.data.train.image_dir
+            train_ds = COCOSegmentDataset(
+                self.train_coco_dataset,
+                image_dir=train_image_dir,
+                sample_percent=sample_pct,
+                seed=seed,
             )
-
-        # Load training dataset from the passed COCO object only.
-        print_rank0("\nLoading training data from passed train_coco_dataset...")
-        train_ds = COCOSegmentDataset(self.train_coco_dataset)
+        else:
+            print_rank0("\nLoading training data from config paths...")
+            train_ds = COCOSegmentDataset.from_split_config(
+                train_cfg.data.train, sample_percent=sample_pct, seed=seed,
+            )
 
         has_validation = False
         val_ds = None
 
         if self.val_coco_dataset is not None:
             print_rank0("\nLoading validation data from passed val_coco_dataset...")
-            val_ds = COCOSegmentDataset(self.val_coco_dataset)
+            val_image_dir = train_cfg.data.valid.image_dir if train_cfg.data.valid else None
+            val_ds = COCOSegmentDataset(
+                self.val_coco_dataset,
+                image_dir=val_image_dir,
+                sample_percent=sample_pct,
+                seed=seed,
+            )
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
             else:
                 print_rank0("Validation dataset is empty.")
+                val_ds = None
+        elif train_cfg.data.valid is not None:
+            print_rank0("\nLoading validation data from config paths...")
+            try:
+                val_ds = COCOSegmentDataset.from_split_config(
+                    train_cfg.data.valid, sample_percent=sample_pct, seed=seed,
+                )
+                if len(val_ds) > 0:
+                    has_validation = True
+                    print_rank0(f"Found validation data: {len(val_ds)} images")
+            except FileNotFoundError as e:
+                print_rank0(f"Validation data not found: {e}")
                 val_ds = None
 
         def collate_fn(batch):

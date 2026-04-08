@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 
 class LRScheduler(str, Enum):
@@ -67,6 +67,13 @@ class DatasetSplit(BaseModel):
         ..., description="Path to the COCO-format annotation JSON"
     )
 
+    @field_serializer("image_dir", "annotation_file")
+    @classmethod
+    def _serialize_as_posix(cls, v: Path) -> str:
+        """Always serialize with forward slashes so configs created on
+        Windows work inside Linux containers."""
+        return v.as_posix()
+
     @field_validator("annotation_file")
     @classmethod
     def annotation_must_be_json(cls, v: Path) -> Path:
@@ -80,6 +87,10 @@ class DataConfig(BaseModel):
 
     train: DatasetSplit
     valid: Optional[DatasetSplit] = None
+    sample_percent: float = Field(
+        100.0, gt=0.0, le=100.0,
+        description="Percentage of each split to use (e.g. 10.0 = 10%)",
+    )
 
 
 class TrainingConfig(BaseModel):
