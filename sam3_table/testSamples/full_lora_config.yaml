@@ -70,8 +70,8 @@ training:
       image_dir: "/data/pubtables_v2_single_pages/val/images"
       annotation_file: "/data/pubtables_v2_single_pages/val/_annotations.coco.json"
     sample_percent: 100.0  # Percentage of dataset to use (e.g. 10.0 = 10%)
-  batch_size: 1      # Increased from 1 to reduce gradient variance
-  num_workers: 2        # Increase for better data loading
+  batch_size: 8      # Sized for H200 (141GB VRAM)
+  num_workers: 8        # More workers to keep the GPU fed
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
@@ -91,7 +91,7 @@ training:
 
   mixed_precision: "bf16"    # Use bfloat16 if available
   seed: 42
-  gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
+  gradient_accumulation_steps: 1  # effective batch: 8×1=8
 
 output:
   output_dir: "outputs/sam3_lora_full"

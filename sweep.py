@@ -1,8 +1,9 @@
 import copy
 from pathlib import Path
 
+import modal
+
 from sam3_table.training_config import SAM3LoRAConfig
-from sam3_table.cstone_train_sam3 import train_sam3, app
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -61,21 +62,8 @@ if __name__ == "__main__":
 
     configs = build_sweep_configs(base_config, global_overrides=global_overrides)
 
-    with app.run():
-        handles = []
-        for i, config in enumerate(configs):
-            handle = train_sam3.spawn(config)
-            handles.append((i, config, handle))
-            lora = config["lora"]
-            lr = config["training"]["learning_rate"]
-            print(f"Launched run {i}: rank={lora['rank']} alpha={lora['alpha']} lr={lr}")
-
-        print(f"\nAll {len(handles)} runs launched in parallel. Waiting for results...\n")
-
-        for i, config, handle in handles:
-            result = handle.get()
-            lora = config["lora"]
-            lr = config["training"]["learning_rate"]
-            print(f"--- Run {i} (rank={lora['rank']} alpha={lora['alpha']} lr={lr}) ---")
-            print(f"  Timestamp:  {result['timestamp']}")
-            print(f"  Output dir: {result['output_dir']}")
+    sweep_fn = modal.Function.from_name("training-sam3", "run_sweep")
+    call = sweep_fn.spawn(configs)
+    print(f"Sweep launched with {len(configs)} configs. Function call ID: {call.object_id}")
+    print("Interrupted runs are resumed automatically.")
+    print("You can safely shut down this machine. Results will be saved to artifacts-vol.")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -28,6 +30,58 @@ MODAL_DATA_DIR = "/data"
 MODAL_ARTIFACTS_DIR = "/artifacts"
 
 
+def _config_fingerprint(config_dict: dict) -> str:
+    """Deterministic hash of a config dict, ignoring output paths."""
+    d = copy.deepcopy(config_dict)
+    d.pop("output", None)
+    return hashlib.sha256(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
+
+
+CHECKPOINT_NAMES = ("checkpoint_epoch.pt", "checkpoint_best.pt", "checkpoint_signal.pt")
+
+
+def _has_any_checkpoint(run_dir: Path) -> bool:
+    """Return True if *run_dir* contains at least one resumable checkpoint."""
+    return any((run_dir / name).exists() for name in CHECKPOINT_NAMES)
+
+
+def _find_resumable_run(config_dict: dict) -> Path | None:
+    """Scan artifacts-vol for an unfinished run whose config matches *config_dict*.
+
+    Returns the run directory if any checkpoint file is found with a matching
+    config fingerprint, otherwise ``None``.  When multiple matches exist the
+    most recently modified checkpoint wins.
+    """
+    target_fp = _config_fingerprint(config_dict)
+    artifacts_root = Path(MODAL_ARTIFACTS_DIR)
+    if not artifacts_root.exists():
+        return None
+
+    matched_dirs: dict[Path, float] = {}
+    for ckpt_name in CHECKPOINT_NAMES:
+        for ckpt in artifacts_root.rglob(ckpt_name):
+            run_dir = ckpt.parent
+            mtime = ckpt.stat().st_mtime
+            if run_dir in matched_dirs:
+                matched_dirs[run_dir] = max(matched_dirs[run_dir], mtime)
+                continue
+            run_config_path = run_dir / "run_config.json"
+            if not run_config_path.exists():
+                continue
+            try:
+                existing = json.loads(run_config_path.read_text())
+                if _config_fingerprint(existing) == target_fp:
+                    matched_dirs[run_dir] = mtime
+            except (json.JSONDecodeError, KeyError):
+                continue
+    candidates = [(mtime, d) for d, mtime in matched_dirs.items()]
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 @app.function(
     gpu="H200",
     image=image,
@@ -41,16 +95,28 @@ def train_sam3(
     val_coco_dataset: COCODataset | None = None,
     test_coco_dataset: COCODataset | None = None,
     device: list[int] | None = None,
+    fresh_run: bool = False,
 ) -> dict[str, str]:
 
     from sam3_table.train_sam3_lora_native import SAM3TrainerNative
 
     config = SAM3LoRAConfig.model_validate(config_dict)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    config.output.output_dir = (
-        f"{MODAL_ARTIFACTS_DIR}/{config.output.output_dir}/{timestamp}"
-    )
-    config.output.logging_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.logging_dir}/{timestamp}"
+
+    artifacts_vol.reload()
+    resumable_dir = None if fresh_run else _find_resumable_run(config_dict)
+
+    if resumable_dir is not None:
+        timestamp = resumable_dir.name
+        config.output.output_dir = str(resumable_dir)
+        config.output.logging_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.logging_dir}/{timestamp}"
+        print(f"Auto-resuming interrupted run {timestamp} from {resumable_dir}")
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        config.output.output_dir = (
+            f"{MODAL_ARTIFACTS_DIR}/{config.output.output_dir}/{timestamp}"
+        )
+        config.output.logging_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.logging_dir}/{timestamp}"
+
     out_dir = Path(config.output.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "run_config.json").write_text(
@@ -83,6 +149,7 @@ def train_sam3(
         val_coco_dataset=val_coco_dataset,
         test_coco_dataset=test_coco_dataset,
         multi_gpu=multi_gpu,
+        on_checkpoint=lambda: artifacts_vol.commit(),
     )
     trainer.train()
 
@@ -96,13 +163,58 @@ def train_sam3(
     return result
 
 
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=3600 * 24,
+)
+def run_sweep(configs: list[dict], fresh_run: bool = False) -> list[dict]:
+    """Orchestrate a sweep entirely in the cloud (CPU-only, no GPU).
+
+    Spawns all training runs in parallel, waits for results server-side,
+    and commits a summary to artifacts-vol.  Each run automatically resumes
+    from a checkpoint if one exists for its config unless *fresh_run* is True.
+    """
+    handles = []
+    for i, config in enumerate(configs):
+        handle = train_sam3.spawn(config, fresh_run=fresh_run)
+        handles.append((i, config, handle))
+        lora = config["lora"]
+        lr = config["training"]["learning_rate"]
+        print(f"Spawned run {i}: rank={lora['rank']} alpha={lora['alpha']} lr={lr}")
+
+    print(f"\nAll {len(handles)} runs spawned. Waiting for results...\n")
+
+    results = []
+    for i, config, handle in handles:
+        lora = config["lora"]
+        lr = config["training"]["learning_rate"]
+        try:
+            result = handle.get()
+        except Exception as exc:
+            print(f"--- Run {i} FAILED (rank={lora['rank']} alpha={lora['alpha']} lr={lr}) ---")
+            print(f"  Error: {exc}")
+            results.append({"error": str(exc), "run_index": i})
+            continue
+        print(f"--- Run {i} (rank={lora['rank']} alpha={lora['alpha']} lr={lr}) ---")
+        print(f"  Timestamp:  {result['timestamp']}")
+        print(f"  Output dir: {result['output_dir']}")
+        results.append(result)
+
+    artifacts_vol.commit()
+    return results
+
+
 def _resolve_run_dir(timestamp: str) -> Path:
     artifacts_root = Path(MODAL_ARTIFACTS_DIR)
     candidates = sorted(
         path
         for path in artifacts_root.rglob(timestamp)
         if path.is_dir()
-        and ((path / "best_lora_weights.pt").exists() or (path / "last_lora_weights.pt").exists())
+        and (
+            (path / "best_lora_weights.pt").exists()
+            or (path / "last_lora_weights.pt").exists()
+            or _has_any_checkpoint(path)
+        )
     )
     if not candidates:
         raise FileNotFoundError(

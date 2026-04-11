@@ -64,7 +64,6 @@ class MultiheadAttentionLoRA(nn.Module):
         if out_proj_bias is not None:
             self.out_proj.bias.data = out_proj_bias.clone()
 
-        self.dropout_layer = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(
         self,
@@ -105,54 +104,57 @@ class MultiheadAttentionLoRA(nn.Module):
         k = k.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # Build a single mask that SDPA can consume. SDPA expects bool masks
+        # where True means "ignore this position" (same convention as PyTorch MHA).
+        combined_mask: Optional[torch.Tensor] = None
 
-        # Apply attention mask - handle various input formats
         if attn_mask is not None:
-            # attn_weights shape: (batch, num_heads, tgt_len, src_len)
             if attn_mask.dim() == 2:
-                # (tgt_len, src_len) -> (1, 1, tgt_len, src_len)
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+                combined_mask = attn_mask.unsqueeze(0).unsqueeze(0)
             elif attn_mask.dim() == 3:
-                # Could be (batch, tgt_len, src_len) or (batch*num_heads, tgt_len, src_len)
                 if attn_mask.shape[0] == batch_size:
-                    # (batch, tgt_len, src_len) -> (batch, 1, tgt_len, src_len)
-                    attn_mask = attn_mask.unsqueeze(1)
+                    combined_mask = attn_mask.unsqueeze(1)
                 elif attn_mask.shape[0] == batch_size * self.num_heads:
-                    # (batch*num_heads, tgt_len, src_len) -> (batch, num_heads, tgt_len, src_len)
-                    attn_mask = attn_mask.view(batch_size, self.num_heads, tgt_len, src_len)
+                    combined_mask = attn_mask.view(batch_size, self.num_heads, tgt_len, src_len)
                 else:
-                    # Unknown format, try to broadcast
-                    attn_mask = attn_mask.unsqueeze(1)
-            elif attn_mask.dim() == 4:
-                # Already (batch, num_heads, tgt_len, src_len) or similar
-                pass
-
-            # Expand to match attn_weights if needed
-            if attn_mask.shape != attn_weights.shape:
-                attn_mask = attn_mask.expand_as(attn_weights)
-
-            if attn_mask.dtype == torch.bool:
-                attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
+                    combined_mask = attn_mask.unsqueeze(1)
             else:
-                attn_weights = attn_weights + attn_mask
+                combined_mask = attn_mask
 
-        # Apply key padding mask
         if key_padding_mask is not None:
-            # key_padding_mask: (batch, src_len), True = ignore
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float('-inf')
+            # (batch, src_len) -> (batch, 1, 1, src_len)
+            kp_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            if combined_mask is not None:
+                if combined_mask.dtype == torch.bool:
+                    combined_mask = combined_mask | kp_mask
+                else:
+                    combined_mask = combined_mask.masked_fill(kp_mask, float('-inf'))
+            else:
+                combined_mask = kp_mask
+
+        dropout_p = self.dropout if self.training else 0.0
+
+        if need_weights:
+            # Manual path: SDPA cannot return attention weights
+            scale = 1.0 / math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if combined_mask is not None:
+                combined_mask = combined_mask.expand(batch_size, self.num_heads, tgt_len, src_len)
+                if combined_mask.dtype == torch.bool:
+                    attn_weights = attn_weights.masked_fill(combined_mask, float('-inf'))
+                else:
+                    attn_weights = attn_weights + combined_mask
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+            attn_output = torch.matmul(attn_weights, v)
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=combined_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
             )
-
-        # Softmax and dropout
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout_layer(attn_weights)
-
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)
+            attn_weights = None
 
         # Reshape back: (batch, num_heads, seq, head_dim) -> (batch, seq, embed_dim)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.embed_dim)
@@ -160,16 +162,14 @@ class MultiheadAttentionLoRA(nn.Module):
         # Output projection - LoRA is applied here
         attn_output = self.out_proj(attn_output)
 
-        # Convert back if not batch_first
         if not self.batch_first:
             attn_output = attn_output.transpose(0, 1)
 
-        if need_weights:
+        if need_weights and attn_weights is not None:
             if average_attn_weights:
                 attn_weights = attn_weights.mean(dim=1)
             return attn_output, attn_weights
-        else:
-            return attn_output, None
+        return attn_output, None
 
 
 class LoRALayer(nn.Module):
@@ -521,8 +521,8 @@ def save_lora_weights(model: nn.Module, save_path: str):
     lora_state_dict = {}
     for name, module in model.named_modules():
         if isinstance(module, LoRALayer):
-            lora_state_dict[f"{name}.lora_A"] = module.lora_A
-            lora_state_dict[f"{name}.lora_B"] = module.lora_B
+            lora_state_dict[f"{name}.lora_A"] = module.lora_A.detach().cpu()
+            lora_state_dict[f"{name}.lora_B"] = module.lora_B.detach().cpu()
 
     torch.save(lora_state_dict, save_path)
     print(f"Saved LoRA weights to {save_path}")
@@ -536,6 +536,6 @@ def load_lora_weights(model: nn.Module, load_path: str):
         model: Model with LoRA layers
         load_path: Path to LoRA weights
     """
-    lora_state_dict = torch.load(load_path)
+    lora_state_dict = torch.load(load_path, map_location="cpu")
     model.load_state_dict(lora_state_dict, strict=False)
     print(f"Loaded LoRA weights from {load_path}")
