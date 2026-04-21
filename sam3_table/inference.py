@@ -21,10 +21,8 @@ from sam3.train.data.sam3_image_dataset import (
 
 from sam3_table.lora_layers import LoRAConfig as LoRALayerConfig
 from sam3_table.lora_layers import apply_lora_to_model
-from sam3_table.train_sam3_lora_native import (
-    convert_predictions_to_coco_format_original_res,
-    resolve_bpe_vocab_path,
-)
+from sam3_table.postprocess import postprocess_sam3_predictions
+from sam3_table.train_sam3_lora_native import resolve_bpe_vocab_path
 from sam3_table.training_config import SAM3LoRAConfig
 
 DEFAULT_QUERY_TEXT = "table"
@@ -178,6 +176,8 @@ def infer_table_detections(
     *,
     config_path: str | Path | None = None,
     score_threshold: float = 0.25,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     query_text: str = DEFAULT_QUERY_TEXT,
     device: str | torch.device | None = None,
 ) -> list[TableDetection]:
@@ -231,29 +231,23 @@ def infer_table_detections(
             for idx in range(pred_logits.shape[0])
         ]
 
-    coco_predictions = convert_predictions_to_coco_format_original_res(
-        predictions_list=predictions_list,
-        image_ids=[0],
-        dataset=dataset,
-        score_threshold=score_threshold,
-    )
-
     detections: list[TableDetection] = []
-    for prediction in sorted(
-        coco_predictions,
-        key=lambda item: float(item["score"]),
-        reverse=True,
-    ):
-        x, y, w, h = prediction["bbox"]
-        x1 = float(x)
-        y1 = float(y)
-        x2 = float(x + w)
-        y2 = float(y + h)
+    processed_predictions = postprocess_sam3_predictions(
+        pred_logits=predictions_list[0]["pred_logits"],
+        pred_masks=predictions_list[0]["pred_masks"],
+        original_size=(image.height, image.width),
+        score_threshold=score_threshold,
+        duplicate_iou_threshold=duplicate_iou_threshold,
+        min_box_area=min_box_area,
+    )
+    for prediction in processed_predictions:
+        x1, y1, w, h = prediction.bbox_xywh
+        x2, y2 = prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]
         detections.append(
             TableDetection(
                 bbox_xywh=(x1, y1, float(w), float(h)),
                 bbox_xyxy=(x1, y1, x2, y2),
-                score=float(prediction["score"]),
+                score=float(prediction.score),
             )
         )
 
@@ -266,6 +260,8 @@ def infer_table_bboxes(
     *,
     config_path: str | Path | None = None,
     score_threshold: float = 0.25,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     query_text: str = DEFAULT_QUERY_TEXT,
     device: str | torch.device | None = None,
 ) -> list[tuple[float, float, float, float]]:
@@ -276,6 +272,8 @@ def infer_table_bboxes(
         image=image,
         config_path=config_path,
         score_threshold=score_threshold,
+        duplicate_iou_threshold=duplicate_iou_threshold,
+        min_box_area=min_box_area,
         query_text=query_text,
         device=device,
     )

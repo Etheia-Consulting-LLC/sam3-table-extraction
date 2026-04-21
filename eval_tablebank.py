@@ -15,6 +15,7 @@ import modal
 from sam3_table.coco_schema import COCODataset
 from sam3_table.lora_layers import LoRAConfig as LoRALayerConfig
 from sam3_table.lora_layers import apply_lora_to_model
+from sam3_table.postprocess import postprocess_sam3_predictions
 from sam3_table.training_config import SAM3LoRAConfig
 from voc_to_coco import convert_voc_to_coco
 
@@ -213,75 +214,6 @@ def resolve_bpe_vocab_path() -> str:
     return str(BPE_CACHE_PATH)
 
 
-def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
-    if len(binary_masks) == 0:
-        return binary_masks, scores, boxes
-
-    import torch
-
-    sorted_indices = torch.argsort(scores, descending=True)
-    binary_masks = binary_masks[sorted_indices]
-    scores = scores[sorted_indices]
-    boxes = boxes[sorted_indices]
-
-    merged_masks = []
-    merged_scores = []
-    merged_boxes = []
-    used = torch.zeros(len(binary_masks), dtype=torch.bool)
-
-    for i in range(len(binary_masks)):
-        if used[i]:
-            continue
-
-        current_mask = binary_masks[i].clone()
-        current_score = scores[i].item()
-        current_box = boxes[i]
-        used[i] = True
-
-        for j in range(i + 1, len(binary_masks)):
-            if used[j]:
-                continue
-
-            intersection = (current_mask & binary_masks[j]).sum().item()
-            union = (current_mask | binary_masks[j]).sum().item()
-            iou = intersection / union if union > 0 else 0
-
-            if iou > iou_threshold:
-                current_mask = current_mask | binary_masks[j]
-                current_score = max(current_score, scores[j].item())
-                used[j] = True
-
-        merged_masks.append(current_mask)
-        merged_scores.append(current_score)
-        merged_boxes.append(current_box)
-
-    if len(merged_masks) > 0:
-        merged_masks = torch.stack(merged_masks)
-        merged_scores = torch.tensor(merged_scores, device=scores.device)
-        merged_boxes = torch.stack(merged_boxes)
-    else:
-        merged_masks = binary_masks[:0]
-        merged_scores = scores[:0]
-        merged_boxes = boxes[:0]
-
-    return merged_masks, merged_scores, merged_boxes
-
-
-def _bbox_from_binary_mask(binary_mask) -> list[float] | None:
-    import torch
-
-    nonzero = torch.nonzero(binary_mask, as_tuple=False)
-    if nonzero.numel() == 0:
-        return None
-
-    y_min = float(nonzero[:, 0].min().item())
-    y_max = float(nonzero[:, 0].max().item())
-    x_min = float(nonzero[:, 1].min().item())
-    x_max = float(nonzero[:, 1].max().item())
-
-    return [x_min, y_min, x_max - x_min + 1.0, y_max - y_min + 1.0]
-
-
 def _bbox_iou_xywh(box_a: list[float], box_b: list[float]) -> float:
     ax1, ay1, aw, ah = box_a
     bx1, by1, bw, bh = box_b
@@ -469,6 +401,8 @@ def run_tablebank_eval(
     unique_output_dir: bool = False,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
@@ -629,57 +563,18 @@ def run_tablebank_eval(
             if preds is None or len(preds.get("pred_logits", [])) == 0:
                 continue
 
-            logits = preds["pred_logits"]
-            boxes = preds["pred_boxes"]
-            masks = preds["pred_masks"]
+            processed_predictions = postprocess_sam3_predictions(
+                pred_logits=preds["pred_logits"],
+                pred_masks=preds["pred_masks"],
+                original_size=(item.height, item.width),
+                score_threshold=score_threshold,
+                duplicate_iou_threshold=duplicate_iou_threshold,
+                min_box_area=min_box_area,
+            )
 
-            scores = torch.sigmoid(logits).squeeze(-1)
-            valid_mask = scores > score_threshold
-            scores = scores[valid_mask]
-            boxes = boxes[valid_mask]
-            masks = masks[valid_mask]
-
-            if len(scores) == 0:
-                continue
-
-            masks_sigmoid = torch.sigmoid(masks)
-            masks_upsampled = torch.nn.functional.interpolate(
-                masks_sigmoid.unsqueeze(1).float(),
-                size=(item.height, item.width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            binary_masks = (masks_upsampled > 0.5).cpu()
-
-            del masks_sigmoid, masks_upsampled
-            torch.cuda.empty_cache()
-
-            if len(binary_masks) > 0:
-                binary_masks, scores, boxes = merge_overlapping_masks(
-                    binary_masks,
-                    scores.detach().cpu(),
-                    boxes.detach().cpu(),
-                    iou_threshold=0.3,
-                )
-
-            if len(binary_masks) == 0:
-                continue
-
-            for binary_mask, score, _box in zip(
-                binary_masks,
-                scores.cpu().tolist(),
-                boxes.cpu().tolist(),
-            ):
-                # Build the final bbox from the merged mask so COCO bbox metrics
-                # reflect the same geometry used for mask merging.
-                bbox = _bbox_from_binary_mask(binary_mask)
-                if bbox is None:
-                    continue
-                x, y, w, h = bbox
-                if w < 1.0 or h < 1.0:
-                    continue
-
-                mask_np = binary_mask.numpy().astype(np.uint8)
+            for processed_prediction in processed_predictions:
+                x, y, w, h = processed_prediction.bbox_xywh
+                mask_np = processed_prediction.binary_mask.numpy().astype(np.uint8)
                 rle = mask_utils.encode(np.asfortranarray(mask_np))
                 rle["counts"] = rle["counts"].decode("utf-8")
                 encoded.append(
@@ -688,7 +583,7 @@ def run_tablebank_eval(
                         "image_id": item.image_id,
                         "category_id": 1,
                         "bbox": [float(x), float(y), float(w), float(h)],
-                        "score": float(score),
+                        "score": float(processed_prediction.score),
                         "segmentation": rle,
                     }
                 )
@@ -813,6 +708,8 @@ def run_tablebank_eval(
         "num_images": len(detection_images),
         "num_predictions": len(predictions),
         "score_threshold": score_threshold,
+        "duplicate_iou_threshold": duplicate_iou_threshold,
+        "min_box_area": min_box_area,
         "unique_output_dir": unique_output_dir,
         "dataset_fraction": dataset_fraction,
         "sample_seed": sample_seed,
@@ -851,6 +748,8 @@ def main(
     unique_output_dir: bool = False,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
@@ -861,6 +760,8 @@ def main(
         annotations_path=annotations,
         output_dir=output_dir,
         score_threshold=score_threshold,
+        duplicate_iou_threshold=duplicate_iou_threshold,
+        min_box_area=min_box_area,
         unique_output_dir=unique_output_dir,
         dataset_fraction=dataset_fraction,
         sample_seed=sample_seed,
