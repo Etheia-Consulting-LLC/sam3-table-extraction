@@ -96,6 +96,7 @@ def train_sam3(
     test_coco_dataset: COCODataset | None = None,
     device: list[int] | None = None,
     fresh_run: bool = False,
+    resume_output_dir: str | None = None,
 ) -> dict[str, str]:
 
     from sam3_table.train_sam3_lora_native import SAM3TrainerNative
@@ -103,13 +104,32 @@ def train_sam3(
     config = SAM3LoRAConfig.model_validate(config_dict)
 
     artifacts_vol.reload()
-    resumable_dir = None if fresh_run else _find_resumable_run(config_dict)
+
+    forced_resume_dir: Path | None = None
+    if resume_output_dir is not None:
+        candidate = Path(resume_output_dir)
+        if not candidate.exists():
+            raise FileNotFoundError(f"resume_output_dir does not exist: {candidate}")
+        if not _has_any_checkpoint(candidate):
+            raise FileNotFoundError(
+                f"resume_output_dir has no checkpoint files ({CHECKPOINT_NAMES}): {candidate}"
+            )
+        forced_resume_dir = candidate
+
+    resumable_dir = (
+        forced_resume_dir
+        if forced_resume_dir is not None
+        else (None if fresh_run else _find_resumable_run(config_dict))
+    )
 
     if resumable_dir is not None:
         timestamp = resumable_dir.name
         config.output.output_dir = str(resumable_dir)
         config.output.logging_dir = f"{MODAL_ARTIFACTS_DIR}/{config.output.logging_dir}/{timestamp}"
-        print(f"Auto-resuming interrupted run {timestamp} from {resumable_dir}")
+        if forced_resume_dir is not None:
+            print(f"Resuming explicitly from {resumable_dir}")
+        else:
+            print(f"Auto-resuming interrupted run {timestamp} from {resumable_dir}")
     else:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         config.output.output_dir = (
