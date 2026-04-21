@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +154,39 @@ def _resolve_config_path(
     )
 
 
+def _prepare_output_dir(
+    output_dir_path: Path,
+    score_threshold: float,
+    unique_output_dir: bool,
+) -> Path:
+    if not unique_output_dir:
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+        return output_dir_path
+
+    threshold_tag = f"t{int(round(score_threshold * 100)):03d}"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_output_dir = output_dir_path / f"{timestamp}_{threshold_tag}"
+    run_output_dir.mkdir(parents=True, exist_ok=False)
+    return run_output_dir
+
+
+def _select_detection_subset(
+    items: list[DetectionImage],
+    dataset_fraction: float,
+    sample_seed: int | None,
+) -> list[DetectionImage]:
+    if dataset_fraction >= 1.0 or not items:
+        return items
+
+    subset_size = max(1, int(len(items) * dataset_fraction))
+    if sample_seed is None:
+        return items[:subset_size]
+
+    rng = random.Random(sample_seed)
+    selected_indices = sorted(rng.sample(range(len(items)), k=subset_size))
+    return [items[idx] for idx in selected_indices]
+
+
 def _load_config(
     weights_path: Path,
     config_path: str | Path | None,
@@ -230,6 +265,21 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
         merged_boxes = boxes[:0]
 
     return merged_masks, merged_scores, merged_boxes
+
+
+def _bbox_from_binary_mask(binary_mask) -> list[float] | None:
+    import torch
+
+    nonzero = torch.nonzero(binary_mask, as_tuple=False)
+    if nonzero.numel() == 0:
+        return None
+
+    y_min = float(nonzero[:, 0].min().item())
+    y_max = float(nonzero[:, 0].max().item())
+    x_min = float(nonzero[:, 1].min().item())
+    x_max = float(nonzero[:, 1].max().item())
+
+    return [x_min, y_min, x_max - x_min + 1.0, y_max - y_min + 1.0]
 
 
 def _bbox_iou_xywh(box_a: list[float], box_b: list[float]) -> float:
@@ -416,6 +466,9 @@ def run_tablebank_eval(
     annotations_path: str,
     output_dir: str,
     score_threshold: float = 0.25,
+    unique_output_dir: bool = False,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
@@ -444,8 +497,11 @@ def run_tablebank_eval(
 
     dataset_root_path = Path(dataset_root)
     annotations_root_path = Path(annotations_path)
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_dir_path = _prepare_output_dir(
+        Path(output_dir),
+        score_threshold=score_threshold,
+        unique_output_dir=unique_output_dir,
+    )
 
     resolved_weights_path = Path(weights_path)
     if not resolved_weights_path.exists():
@@ -455,6 +511,8 @@ def run_tablebank_eval(
         annotations_root_path,
         dataset_root_path,
     )
+    if dataset_fraction <= 0.0 or dataset_fraction > 1.0:
+        raise ValueError("dataset_fraction must be in the range (0.0, 1.0].")
     if annotations_format == "voc":
         resolved_annotations_path = output_dir_path / "tablebank_annotations.coco.json"
         convert_voc_to_coco(
@@ -501,6 +559,25 @@ def run_tablebank_eval(
             f"Could not locate {len(missing_files)} image(s) under {dataset_root_path}. "
             f"First missing entries: {preview}"
         )
+
+    detection_images = _select_detection_subset(
+        detection_images,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
+    )
+
+    selected_image_ids = {item.image_id for item in detection_images}
+    selected_annotations = [
+        annotation.model_dump(mode="json")
+        for annotation in coco_dataset.annotations
+        if annotation.image_id in selected_image_ids
+    ]
+    selected_images = [
+        image.model_dump()
+        for image in coco_dataset.images
+        if image.id in selected_image_ids
+    ]
+    selected_categories = [category.model_dump() for category in coco_dataset.categories]
 
     class _TableBankInferenceDataset(Dataset):
         def __init__(self, items: list[DetectionImage], normalized_query: str):
@@ -588,21 +665,17 @@ def run_tablebank_eval(
             if len(binary_masks) == 0:
                 continue
 
-            for binary_mask, score, box in zip(
+            for binary_mask, score, _box in zip(
                 binary_masks,
                 scores.cpu().tolist(),
                 boxes.cpu().tolist(),
             ):
-                cx, cy, w_norm, h_norm = box
-                x = (cx - w_norm / 2) * item.width
-                y = (cy - h_norm / 2) * item.height
-                w = w_norm * item.width
-                h = h_norm * item.height
-
-                x = max(0.0, min(x, item.width))
-                y = max(0.0, min(y, item.height))
-                w = max(0.0, min(w, item.width - x))
-                h = max(0.0, min(h, item.height - y))
+                # Build the final bbox from the merged mask so COCO bbox metrics
+                # reflect the same geometry used for mask merging.
+                bbox = _bbox_from_binary_mask(binary_mask)
+                if bbox is None:
+                    continue
+                x, y, w, h = bbox
                 if w < 1.0 or h < 1.0:
                     continue
 
@@ -705,9 +778,9 @@ def run_tablebank_eval(
     predictions_path.write_text(json.dumps(predictions, indent=2, default=_json_default))
 
     gt_payload = {
-        "images": [image.model_dump() for image in coco_dataset.images],
-        "annotations": [annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
-        "categories": [category.model_dump() for category in coco_dataset.categories],
+        "images": selected_images,
+        "annotations": selected_annotations,
+        "categories": selected_categories,
         "info": {"description": "TableBank evaluation ground truth"},
     }
     gt_path = output_dir_path / "ground_truth.coco.json"
@@ -722,12 +795,12 @@ def run_tablebank_eval(
 
     prf_metrics = _match_detections_at_iou50(
         predictions=predictions,
-        annotations=[annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
+        annotations=selected_annotations,
     )
     visualization_summary = _render_eval_visualizations(
         detection_images=detection_images,
         predictions=predictions,
-        annotations=[annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
+        annotations=selected_annotations,
         output_dir_path=output_dir_path,
         max_images=visualize_max_images,
     )
@@ -736,9 +809,13 @@ def run_tablebank_eval(
         "config_path": str(resolved_weights_path.with_name("run_config.json")),
         "dataset_root": str(dataset_root_path),
         "annotations_path": str(resolved_annotations_path),
+        "output_dir": str(output_dir_path),
         "num_images": len(detection_images),
         "num_predictions": len(predictions),
         "score_threshold": score_threshold,
+        "unique_output_dir": unique_output_dir,
+        "dataset_fraction": dataset_fraction,
+        "sample_seed": sample_seed,
         "query_text": normalized_query,
         "metrics": {
             "map": float(coco_eval.stats[0]),
@@ -771,6 +848,9 @@ def main(
     annotations: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
     output_dir: str = "/artifacts/tablebank_eval",
     score_threshold: float = 0.25,
+    unique_output_dir: bool = False,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
@@ -781,6 +861,9 @@ def main(
         annotations_path=annotations,
         output_dir=output_dir,
         score_threshold=score_threshold,
+        unique_output_dir=unique_output_dir,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
         query_text=query_text,
         batch_size=batch_size,
         visualize_max_images=visualize_max_images,

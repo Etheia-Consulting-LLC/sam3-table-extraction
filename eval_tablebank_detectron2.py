@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -289,6 +290,23 @@ def _render_eval_visualizations(
     }
 
 
+def _select_detection_subset(
+    items: list[DetectionImage],
+    dataset_fraction: float,
+    sample_seed: int | None,
+) -> list[DetectionImage]:
+    if dataset_fraction >= 1.0 or not items:
+        return items
+
+    subset_size = max(1, int(len(items) * dataset_fraction))
+    if sample_seed is None:
+        return items[:subset_size]
+
+    rng = random.Random(sample_seed)
+    selected_indices = sorted(rng.sample(range(len(items)), k=subset_size))
+    return [items[idx] for idx in selected_indices]
+
+
 def _resolve_model_input(
     file_or_url: str,
     download_dir: Path,
@@ -327,6 +345,8 @@ def run_tablebank_detectron2_eval(
     annotations_path: str,
     output_dir: str,
     score_threshold: float = 0.9,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
     visualize_max_images: int = 20,
 ) -> dict[str, Any]:
     from detectron2.config import get_cfg
@@ -352,6 +372,8 @@ def run_tablebank_detectron2_eval(
         annotations_root_path,
         dataset_root_path,
     )
+    if dataset_fraction <= 0.0 or dataset_fraction > 1.0:
+        raise ValueError("dataset_fraction must be in the range (0.0, 1.0].")
     if annotations_format == "voc":
         resolved_annotations_path = output_dir_path / "tablebank_annotations.coco.json"
         convert_voc_to_coco(
@@ -399,6 +421,24 @@ def run_tablebank_detectron2_eval(
             f"First missing entries: {preview}"
         )
 
+    detection_images = _select_detection_subset(
+        detection_images,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
+    )
+    selected_image_ids = {item.image_id for item in detection_images}
+    selected_annotations = [
+        annotation.model_dump(mode="json")
+        for annotation in coco_dataset.annotations
+        if annotation.image_id in selected_image_ids
+    ]
+    selected_images = [
+        image.model_dump()
+        for image in coco_dataset.images
+        if image.id in selected_image_ids
+    ]
+    selected_categories = [category.model_dump() for category in coco_dataset.categories]
+
     cfg = get_cfg()
     cfg.merge_from_file(str(resolved_config_path))
     cfg.MODEL.WEIGHTS = str(resolved_weights_path)
@@ -441,9 +481,9 @@ def run_tablebank_detectron2_eval(
     predictions_path.write_text(json.dumps(predictions, indent=2, default=_json_default))
 
     gt_payload = {
-        "images": [image.model_dump() for image in coco_dataset.images],
-        "annotations": [annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
-        "categories": [category.model_dump() for category in coco_dataset.categories],
+        "images": selected_images,
+        "annotations": selected_annotations,
+        "categories": selected_categories,
         "info": {"description": "TableBank evaluation ground truth"},
     }
     gt_path = output_dir_path / "ground_truth.coco.json"
@@ -456,15 +496,14 @@ def run_tablebank_detectron2_eval(
     coco_eval.accumulate()
     coco_eval.summarize()
 
-    annotations_json = [annotation.model_dump(mode="json") for annotation in coco_dataset.annotations]
     prf_metrics = _match_detections_at_iou50(
         predictions=predictions,
-        annotations=annotations_json,
+        annotations=selected_annotations,
     )
     visualization_summary = _render_eval_visualizations(
         detection_images=detection_images,
         predictions=predictions,
-        annotations=annotations_json,
+        annotations=selected_annotations,
         output_dir_path=output_dir_path,
         max_images=visualize_max_images,
     )
@@ -478,6 +517,8 @@ def run_tablebank_detectron2_eval(
         "num_images": len(detection_images),
         "num_predictions": len(predictions),
         "score_threshold": score_threshold,
+        "dataset_fraction": dataset_fraction,
+        "sample_seed": sample_seed,
         "metrics": {
             "map": float(coco_eval.stats[0]),
             "map50": float(coco_eval.stats[1]),
@@ -511,6 +552,8 @@ def main(
     annotations: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
     output_dir: str = "/artifacts/tablebank_detectron2_eval",
     score_threshold: float = 0.9,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
     visualize_max_images: int = 20,
 ):
     result = run_tablebank_detectron2_eval.remote(
@@ -520,6 +563,8 @@ def main(
         annotations_path=annotations,
         output_dir=output_dir,
         score_threshold=score_threshold,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
         visualize_max_images=visualize_max_images,
     )
     print(json.dumps(result, indent=2, default=_json_default))
