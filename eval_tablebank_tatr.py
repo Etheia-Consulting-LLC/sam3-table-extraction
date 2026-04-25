@@ -2,41 +2,40 @@
 from __future__ import annotations
 
 import json
-import os
 import random
-import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import modal
 
 from sam3_table.coco_schema import COCODataset
-from sam3_table.lora_layers import LoRAConfig as LoRALayerConfig
-from sam3_table.lora_layers import apply_lora_to_model
-from sam3_table.postprocess import postprocess_sam3_predictions
-from sam3_table.training_config import SAM3LoRAConfig
 from voc_to_coco import convert_voc_to_coco
 
-TABLEBANK_IMAGE = (
-    modal.Image.debian_slim()
-    .apt_install("git")
+DEFAULT_TATR_MODEL_NAME = "microsoft/table-transformer-detection"
+DEFAULT_TABLE_CLASS_NAMES = ("table", "table rotated")
+
+TATR_TABLEBANK_IMAGE = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "git",
+        "libgl1",
+        "libglib2.0-0",
+        "libsm6",
+        "libxext6",
+    )
     .pip_install_from_requirements("requirements.txt")
-    .pip_install("triton", "pycocotools")
     .add_local_python_source("sam3_table")
     .add_local_file("voc_to_coco.py", remote_path="/root/voc_to_coco.py")
 )
 
-app = modal.App(name="tablebank-eval", image=TABLEBANK_IMAGE)
+app = modal.App(name="tablebank-tatr-eval", image=TATR_TABLEBANK_IMAGE)
 
 tablebank_vol = modal.Volume.from_name("tablebank-vol")
 artifacts_vol = modal.Volume.from_name("artifacts-vol", create_if_missing=True)
 
 MODAL_DATA_DIR = "/data"
 MODAL_ARTIFACTS_DIR = "/artifacts"
-BPE_VOCAB_URL = "https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz"
-BPE_CACHE_PATH = Path("/tmp/bpe_simple_vocab_16e6.txt.gz")
 
 
 @dataclass(frozen=True)
@@ -106,112 +105,6 @@ def _resolve_annotations_source(
         f"Could not find COCO JSON or VOC XML annotations under "
         f"{annotations_path} or {dataset_root_path}"
     )
-
-
-def _resolve_device(device: str | Any | None) -> Any:
-    import torch
-
-    if device is None:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device)
-
-
-def _move_to_device(obj: Any, device: Any) -> Any:
-    import torch
-
-    if torch.is_tensor(obj):
-        return obj.to(device)
-    if isinstance(obj, list):
-        return [_move_to_device(item, device) for item in obj]
-    if isinstance(obj, tuple):
-        return tuple(_move_to_device(item, device) for item in obj)
-    if isinstance(obj, dict):
-        return {key: _move_to_device(value, device) for key, value in obj.items()}
-    if hasattr(obj, "__dataclass_fields__"):
-        for field in obj.__dataclass_fields__:
-            setattr(obj, field, _move_to_device(getattr(obj, field), device))
-        return obj
-    return obj
-
-
-def _resolve_config_path(
-    weights_path: Path,
-    config_path: str | Path | None,
-) -> Path:
-    if config_path is not None:
-        resolved_config_path = Path(config_path)
-        if not resolved_config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {resolved_config_path}")
-        return resolved_config_path
-
-    sibling_config_path = weights_path.with_name("run_config.json")
-    if sibling_config_path.exists():
-        return sibling_config_path
-
-    raise FileNotFoundError(
-        "Could not find a config for the LoRA weights. "
-        "Expected a sibling run_config.json next to the weights file, "
-        "or pass config_path explicitly."
-    )
-
-
-def _prepare_output_dir(
-    output_dir_path: Path,
-    score_threshold: float,
-    unique_output_dir: bool,
-) -> Path:
-    if not unique_output_dir:
-        output_dir_path.mkdir(parents=True, exist_ok=True)
-        return output_dir_path
-
-    threshold_tag = f"t{int(round(score_threshold * 100)):03d}"
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_output_dir = output_dir_path / f"{timestamp}_{threshold_tag}"
-    run_output_dir.mkdir(parents=True, exist_ok=False)
-    return run_output_dir
-
-
-def _select_detection_subset(
-    items: list[DetectionImage],
-    dataset_fraction: float,
-    sample_seed: int | None,
-) -> list[DetectionImage]:
-    if dataset_fraction >= 1.0 or not items:
-        return items
-
-    subset_size = max(1, int(len(items) * dataset_fraction))
-    if sample_seed is None:
-        return items[:subset_size]
-
-    rng = random.Random(sample_seed)
-    selected_indices = sorted(rng.sample(range(len(items)), k=subset_size))
-    return [items[idx] for idx in selected_indices]
-
-
-def _load_config(
-    weights_path: Path,
-    config_path: str | Path | None,
-) -> SAM3LoRAConfig:
-    resolved_config_path = _resolve_config_path(weights_path, config_path)
-    if resolved_config_path.suffix.lower() == ".json":
-        return SAM3LoRAConfig.model_validate(
-            json.loads(resolved_config_path.read_text())
-        )
-    return SAM3LoRAConfig.from_yaml(resolved_config_path)
-
-
-def resolve_bpe_vocab_path() -> str:
-    env_path = os.environ.get("SAM3_BPE_PATH")
-    if env_path and Path(env_path).exists():
-        return env_path
-
-    if BPE_CACHE_PATH.exists():
-        return str(BPE_CACHE_PATH)
-
-    BPE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading SAM3 BPE vocab to {BPE_CACHE_PATH}...")
-    urllib.request.urlretrieve(BPE_VOCAB_URL, BPE_CACHE_PATH)
-    return str(BPE_CACHE_PATH)
 
 
 def _bbox_iou_xywh(box_a: list[float], box_b: list[float]) -> float:
@@ -385,61 +278,53 @@ def _render_eval_visualizations(
     }
 
 
+def _select_detection_subset(
+    items: list[DetectionImage],
+    dataset_fraction: float,
+    sample_seed: int | None,
+) -> list[DetectionImage]:
+    if dataset_fraction >= 1.0 or not items:
+        return items
+
+    subset_size = max(1, int(len(items) * dataset_fraction))
+    if sample_seed is None:
+        return items[:subset_size]
+
+    rng = random.Random(sample_seed)
+    selected_indices = sorted(rng.sample(range(len(items)), k=subset_size))
+    return [items[idx] for idx in selected_indices]
+
+
 @app.function(
-    gpu="H200",
-    image=TABLEBANK_IMAGE,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    gpu="T4",
+    image=TATR_TABLEBANK_IMAGE,
     volumes={MODAL_DATA_DIR: tablebank_vol, MODAL_ARTIFACTS_DIR: artifacts_vol},
     timeout=3600 * 24,
 )
-def run_tablebank_eval(
-    weights_path: str,
+def run_tablebank_tatr_eval(
     dataset_root: str,
     annotations_path: str,
     output_dir: str,
-    score_threshold: float = 0.25,
-    unique_output_dir: bool = False,
+    model_name: str = DEFAULT_TATR_MODEL_NAME,
+    score_threshold: float = 0.9,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
-    duplicate_iou_threshold: float = 0.5,
-    min_box_area: float = 16.0,
-    query_text: str = "table",
-    batch_size: int = 8,
     visualize_max_images: int = 20,
+    class_names: str = ",".join(DEFAULT_TABLE_CLASS_NAMES),
 ) -> dict[str, Any]:
-    import numpy as np
-    import pycocotools.mask as mask_utils
     import torch
     from PIL import Image as PILImage
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
-    from sam3.model.model_misc import SAM3Output
-    from sam3.train.data.collator import collate_fn_api
-    from sam3.train.data.sam3_image_dataset import (
-        Datapoint,
-        FindQueryLoaded,
-        Image,
-        InferenceMetadata,
-    )
-    from torch.utils.data import Dataset
-    from torchvision.transforms import v2
-
-    from sam3_table.model_builder import build_sam3_image_model
+    from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
     tablebank_vol.reload()
     artifacts_vol.reload()
 
     dataset_root_path = Path(dataset_root)
     annotations_root_path = Path(annotations_path)
-    output_dir_path = _prepare_output_dir(
-        Path(output_dir),
-        score_threshold=score_threshold,
-        unique_output_dir=unique_output_dir,
-    )
-
-    resolved_weights_path = Path(weights_path)
-    if not resolved_weights_path.exists():
-        raise FileNotFoundError(f"Weights file not found: {resolved_weights_path}")
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
 
     resolved_annotations_input, annotations_format = _resolve_annotations_source(
         annotations_root_path,
@@ -447,6 +332,7 @@ def run_tablebank_eval(
     )
     if dataset_fraction <= 0.0 or dataset_fraction > 1.0:
         raise ValueError("dataset_fraction must be in the range (0.0, 1.0].")
+
     if annotations_format == "voc":
         resolved_annotations_path = output_dir_path / "tablebank_annotations.coco.json"
         convert_voc_to_coco(
@@ -499,7 +385,6 @@ def run_tablebank_eval(
         dataset_fraction=dataset_fraction,
         sample_seed=sample_seed,
     )
-
     selected_image_ids = {item.image_id for item in detection_images}
     selected_annotations = [
         annotation.model_dump(mode="json")
@@ -513,161 +398,79 @@ def run_tablebank_eval(
     ]
     selected_categories = [category.model_dump() for category in coco_dataset.categories]
 
-    class _TableBankInferenceDataset(Dataset):
-        def __init__(self, items: list[DetectionImage], normalized_query: str):
-            self.items = items
-            self.query = normalized_query
-            self.resolution = 1008
-            self.transform = v2.Compose(
-                [
-                    v2.ToImage(),
-                    v2.ToDtype(torch.float32, scale=True),
-                    v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-                ]
-            )
-
-        def __len__(self) -> int:
-            return len(self.items)
-
-        def __getitem__(self, idx: int) -> Datapoint:
-            item = self.items[idx]
-            image = PILImage.open(item.image_path).convert("RGB")
-            resized = image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
-            image_tensor = self.transform(resized)
-            image_obj = Image(data=image_tensor, objects=[], size=(self.resolution, self.resolution))
-            query = FindQueryLoaded(
-                query_text=self.query,
-                image_id=0,
-                object_ids_output=[],
-                is_exhaustive=True,
-                query_processing_order=0,
-                inference_metadata=InferenceMetadata(
-                    coco_image_id=item.image_id,
-                    original_image_id=item.image_id,
-                    original_category_id=1,
-                    original_size=(item.height, item.width),
-                    object_id=-1,
-                    frame_index=-1,
-                ),
-            )
-            return Datapoint(find_queries=[query], images=[image_obj], raw_images=[resized])
-
-    def _encode_predictions_for_items(
-        items: list[DetectionImage],
-        predictions_list: list[dict[str, torch.Tensor]],
-        pred_id_start: int,
-    ) -> tuple[list[dict[str, Any]], int]:
-        encoded: list[dict[str, Any]] = []
-        pred_id = pred_id_start
-        for item, preds in zip(items, predictions_list):
-            if preds is None or len(preds.get("pred_logits", [])) == 0:
-                continue
-
-            processed_predictions = postprocess_sam3_predictions(
-                pred_logits=preds["pred_logits"],
-                pred_masks=preds["pred_masks"],
-                original_size=(item.height, item.width),
-                score_threshold=score_threshold,
-                duplicate_iou_threshold=duplicate_iou_threshold,
-                min_box_area=min_box_area,
-            )
-
-            for processed_prediction in processed_predictions:
-                x, y, w, h = processed_prediction.bbox_xywh
-                mask_np = processed_prediction.binary_mask.numpy().astype(np.uint8)
-                rle = mask_utils.encode(np.asfortranarray(mask_np))
-                rle["counts"] = rle["counts"].decode("utf-8")
-                encoded.append(
-                    {
-                        "id": pred_id,
-                        "image_id": item.image_id,
-                        "category_id": 1,
-                        "bbox": [float(x), float(y), float(w), float(h)],
-                        "score": float(processed_prediction.score),
-                        "segmentation": rle,
-                    }
-                )
-                pred_id += 1
-
-        return encoded, pred_id
-
-    device_obj = _resolve_device("cuda" if torch.cuda.is_available() else "cpu")
-    config = _load_config(resolved_weights_path, None)
-    model = build_sam3_image_model(
-        device=device_obj.type,
-        compile=False,
-        load_from_HF=True,
-        bpe_path=resolve_bpe_vocab_path(),
-        eval_mode=True,
-    )
-    lora_cfg = config.lora
-    model = apply_lora_to_model(
-        model,
-        LoRALayerConfig(
-            rank=lora_cfg.rank,
-            alpha=lora_cfg.alpha,
-            dropout=lora_cfg.dropout,
-            target_modules=lora_cfg.target_modules,
-            apply_to_vision_encoder=lora_cfg.apply_to_vision_encoder,
-            apply_to_text_encoder=lora_cfg.apply_to_text_encoder,
-            apply_to_geometry_encoder=lora_cfg.apply_to_geometry_encoder,
-            apply_to_detr_encoder=lora_cfg.apply_to_detr_encoder,
-            apply_to_detr_decoder=lora_cfg.apply_to_detr_decoder,
-            apply_to_mask_decoder=lora_cfg.apply_to_mask_decoder,
-        ),
-    )
-    lora_state_dict = torch.load(resolved_weights_path, map_location=device_obj)
-    model.load_state_dict(lora_state_dict, strict=False)
-    model.to(device_obj)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    image_processor = AutoImageProcessor.from_pretrained(model_name)
+    model = TableTransformerForObjectDetection.from_pretrained(model_name)
+    model.to(device)
     model.eval()
 
-    normalized_query = query_text.strip().lower() or "table"
-    dataset = _TableBankInferenceDataset(detection_images, normalized_query)
+    requested_class_names = {
+        item.strip().lower()
+        for item in class_names.split(",")
+        if item.strip()
+    }
+    if not requested_class_names:
+        raise ValueError("class_names must include at least one label.")
+
+    id2label = {
+        int(label_id): str(label_name).lower()
+        for label_id, label_name in model.config.id2label.items()
+    }
+    valid_label_ids = {
+        label_id
+        for label_id, label_name in id2label.items()
+        if label_name in requested_class_names
+    }
+    if not valid_label_ids:
+        raise ValueError(
+            f"Could not match requested labels {sorted(requested_class_names)} against "
+            f"model labels {sorted(set(id2label.values()))}"
+        )
+
     predictions: list[dict[str, Any]] = []
     next_prediction_id = 0
+    for idx, item in enumerate(detection_images, start=1):
+        image_rgb = PILImage.open(item.image_path).convert("RGB")
+        inputs = image_processor(images=image_rgb, return_tensors="pt")
+        inputs = {name: value.to(device) for name, value in inputs.items()}
 
-    for start in range(0, len(dataset), batch_size):
-        end = min(start + batch_size, len(dataset))
-        batch_items = detection_images[start:end]
-        batch = collate_fn_api(
-            [dataset[idx] for idx in range(start, end)],
-            dict_key="input",
-            with_seg_masks=True,
-        )
-        input_batch = _move_to_device(batch["input"], device_obj)
         with torch.inference_mode():
-            outputs = model(input_batch)
+            outputs = model(**inputs)
 
-        with SAM3Output.iteration_mode(outputs, SAM3Output.IterMode.LAST_STEP_PER_STAGE):
-            final_stage = list(outputs)[-1]
+        target_sizes = torch.tensor([(image_rgb.height, image_rgb.width)], device=device)
+        results = image_processor.post_process_object_detection(
+            outputs,
+            threshold=score_threshold,
+            target_sizes=target_sizes,
+        )[0]
 
-        pred_logits = final_stage["pred_logits"]
-        pred_boxes = final_stage["pred_boxes"]
-        pred_masks = final_stage["pred_masks"]
-        if pred_logits.dim() == 2:
-            predictions_list = [
+        boxes = results["boxes"].detach().cpu().tolist()
+        scores = results["scores"].detach().cpu().tolist()
+        labels = results["labels"].detach().cpu().tolist()
+
+        for box_xyxy, score, label_id in zip(boxes, scores, labels):
+            if int(label_id) not in valid_label_ids:
+                continue
+            x1, y1, x2, y2 = box_xyxy
+            w = max(0.0, x2 - x1)
+            h = max(0.0, y2 - y1)
+            if w < 1.0 or h < 1.0:
+                continue
+            predictions.append(
                 {
-                    "pred_logits": pred_logits.detach(),
-                    "pred_boxes": pred_boxes.detach(),
-                    "pred_masks": pred_masks.detach(),
+                    "id": next_prediction_id,
+                    "image_id": item.image_id,
+                    "category_id": 1,
+                    "bbox": [float(x1), float(y1), float(w), float(h)],
+                    "score": float(score),
+                    "label_id": int(label_id),
+                    "label_name": id2label[int(label_id)],
                 }
-            ]
-        else:
-            predictions_list = [
-                {
-                    "pred_logits": pred_logits[idx].detach(),
-                    "pred_boxes": pred_boxes[idx].detach(),
-                    "pred_masks": pred_masks[idx].detach(),
-                }
-                for idx in range(pred_logits.shape[0])
-            ]
+            )
+            next_prediction_id += 1
 
-        encoded_batch, next_prediction_id = _encode_predictions_for_items(
-            batch_items,
-            predictions_list,
-            next_prediction_id,
-        )
-        predictions.extend(encoded_batch)
+        if idx % 1000 == 0:
+            print(f"Processed {idx}/{len(detection_images)} images")
 
     predictions_path = output_dir_path / "predictions.coco.json"
     predictions_path.write_text(json.dumps(predictions, indent=2, default=_json_default))
@@ -699,6 +502,7 @@ def run_tablebank_eval(
         output_dir_path=output_dir_path,
         max_images=visualize_max_images,
     )
+
     metrics = {
         "map": float(coco_eval.stats[0]),
         "map50": float(coco_eval.stats[1]),
@@ -712,29 +516,26 @@ def run_tablebank_eval(
     }
     summary = {
         "summary_version": "tablebank_eval.v1",
-        "baseline_id": "sam3lora",
-        "baseline_name": "SAM3 LoRA",
-        "model_family": "sam3",
-        "weights_path": str(resolved_weights_path),
-        "config_path": str(resolved_weights_path.with_name("run_config.json")),
+        "baseline_id": "detr",
+        "baseline_name": "TATR DETR R18",
+        "model_family": "detr",
+        "model_name": model_name,
         "dataset_root": str(dataset_root_path),
         "annotations_path": str(resolved_annotations_path),
         "output_dir": str(output_dir_path),
         "num_images": len(detection_images),
         "num_predictions": len(predictions),
         "score_threshold": score_threshold,
-        "duplicate_iou_threshold": duplicate_iou_threshold,
-        "min_box_area": min_box_area,
-        "unique_output_dir": unique_output_dir,
         "dataset_fraction": dataset_fraction,
         "sample_seed": sample_seed,
-        "query_text": normalized_query,
+        "class_names": sorted(requested_class_names),
+        "device": device,
         "model": {
-            "family": "sam3",
-            "variant": "sam3-lora",
-            "weights_path": str(resolved_weights_path),
-            "config_path": str(resolved_weights_path.with_name("run_config.json")),
-            "device": device_obj.type,
+            "family": "detr",
+            "variant": "table-transformer-detection",
+            "model_name": model_name,
+            "class_names": sorted(requested_class_names),
+            "device": device,
         },
         "evaluation": {
             "task": "table_detection",
@@ -750,11 +551,8 @@ def run_tablebank_eval(
             "visualize_max_images": visualize_max_images,
         },
         "parameters": {
-            "query_text": normalized_query,
-            "batch_size": batch_size,
-            "duplicate_iou_threshold": duplicate_iou_threshold,
-            "min_box_area": min_box_area,
-            "unique_output_dir": unique_output_dir,
+            "class_names": sorted(requested_class_names),
+            "score_threshold": score_threshold,
         },
         "metrics": metrics,
         "artifacts": {
@@ -767,40 +565,32 @@ def run_tablebank_eval(
     }
     metrics_path = output_dir_path / "metrics.json"
     metrics_path.write_text(json.dumps(summary, indent=2, default=_json_default))
+
     artifacts_vol.commit()
     return summary
 
 
 @app.local_entrypoint()
 def main(
-    weights: str,
     dataset_root: str = "/data/tablebank/extracted/TableBank/TableBank/Detection",
     annotations: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
-    output_dir: str = "/artifacts/tablebank_eval",
-    score_threshold: float = 0.25,
-    unique_output_dir: bool = False,
+    output_dir: str = "/artifacts/tablebank_tatr_eval",
+    model_name: str = DEFAULT_TATR_MODEL_NAME,
+    score_threshold: float = 0.9,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
-    duplicate_iou_threshold: float = 0.5,
-    min_box_area: float = 16.0,
-    query_text: str = "table",
-    batch_size: int = 8,
     visualize_max_images: int = 20,
+    class_names: str = ",".join(DEFAULT_TABLE_CLASS_NAMES),
 ):
-    result = run_tablebank_eval.remote(
-        weights_path=weights,
+    result = run_tablebank_tatr_eval.remote(
         dataset_root=dataset_root,
         annotations_path=annotations,
         output_dir=output_dir,
+        model_name=model_name,
         score_threshold=score_threshold,
-        duplicate_iou_threshold=duplicate_iou_threshold,
-        min_box_area=min_box_area,
-        unique_output_dir=unique_output_dir,
         dataset_fraction=dataset_fraction,
         sample_seed=sample_seed,
-        query_text=query_text,
-        batch_size=batch_size,
         visualize_max_images=visualize_max_images,
+        class_names=class_names,
     )
     print(json.dumps(result, indent=2, default=_json_default))
-
