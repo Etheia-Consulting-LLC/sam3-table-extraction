@@ -26,11 +26,13 @@ import argparse
 import json
 import signal
 import urllib.request
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from pathlib import Path
 import numpy as np
@@ -843,7 +845,7 @@ class SAM3TrainerNative:
         print_rank0("Building SAM3 model...")
         self.model = build_sam3_image_model(
             device=self.device.type,
-            compile=False,
+            compile=self.config.hardware.use_compile,
             load_from_HF=True,
             bpe_path=resolve_bpe_vocab_path(),
             eval_mode=False
@@ -902,7 +904,10 @@ class SAM3TrainerNative:
             [p for p in self.model.parameters() if p.requires_grad],
             lr=train_cfg.learning_rate,
             weight_decay=train_cfg.weight_decay,
+            betas=(train_cfg.adam_beta1, train_cfg.adam_beta2),
+            eps=train_cfg.adam_epsilon,
         )
+        self.scheduler: LambdaLR | None = None
         
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
@@ -982,6 +987,7 @@ class SAM3TrainerNative:
             "best_val_loss": best_val_loss,
             "lora_state_dict": lora_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
         }
         torch.save(checkpoint, path)
         print_rank0(f"Checkpoint saved to {path} (epoch {epoch + 1}, global_step {global_step})")
@@ -997,6 +1003,9 @@ class SAM3TrainerNative:
         model_to_load = self.model.module if self.multi_gpu else self.model
         model_to_load.load_state_dict(checkpoint["lora_state_dict"], strict=False)
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if self.scheduler is not None and scheduler_state is not None:
+            self.scheduler.load_state_dict(scheduler_state)
         gs = checkpoint.get("global_step", 0)
         sie = checkpoint.get("step_in_epoch", 0)
         print_rank0(
@@ -1033,6 +1042,38 @@ class SAM3TrainerNative:
         self._shutdown_requested = True
         sig_name = signal.Signals(signum).name
         print_rank0(f"\n{sig_name} received. Will save checkpoint after current batch...")
+
+    def _build_lr_scheduler(self, total_optimizer_steps: int) -> LambdaLR | None:
+        train_cfg = self.config.training
+        scheduler_name = train_cfg.lr_scheduler.value
+        warmup_steps = max(0, int(train_cfg.warmup_steps))
+
+        if total_optimizer_steps <= 0:
+            return None
+
+        def lr_lambda(current_step: int) -> float:
+            if warmup_steps > 0 and current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+
+            if scheduler_name in {"constant", "constant_with_warmup"}:
+                return 1.0
+
+            decay_steps = max(1, total_optimizer_steps - warmup_steps)
+            progress = min(1.0, float(current_step - warmup_steps) / float(decay_steps))
+
+            if scheduler_name == "linear":
+                return max(0.0, 1.0 - progress)
+
+            if scheduler_name == "cosine":
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            return 1.0
+
+        print_rank0(
+            f"Scheduler: {scheduler_name} (warmup_steps={warmup_steps}, "
+            f"total_optimizer_steps={total_optimizer_steps})"
+        )
+        return LambdaLR(self.optimizer, lr_lambda=lr_lambda)
 
     def train(self):
         train_cfg = self.config.training
@@ -1115,7 +1156,7 @@ class SAM3TrainerNative:
             sampler=train_sampler,
             collate_fn=collate_fn,
             num_workers=train_cfg.num_workers,
-            pin_memory=True,
+            pin_memory=self.config.hardware.dataloader_pin_memory,
             persistent_workers=persistent,
             prefetch_factor=2 if train_cfg.num_workers > 0 else None,
         )
@@ -1128,7 +1169,7 @@ class SAM3TrainerNative:
                 sampler=val_sampler,
                 collate_fn=collate_fn,
                 num_workers=train_cfg.num_workers,
-                pin_memory=True,
+                pin_memory=self.config.hardware.dataloader_pin_memory,
                 persistent_workers=persistent,
                 prefetch_factor=2 if train_cfg.num_workers > 0 else None,
             )
@@ -1172,6 +1213,19 @@ class SAM3TrainerNative:
         out_dir = Path(self.config.output.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        steps_per_epoch = len(train_loader)
+        print_rank0(f"Steps per epoch: {steps_per_epoch}")
+        if has_validation:
+            print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
+        else:
+            print_rank0(f"Training samples: {len(train_ds)}")
+            print_rank0("No validation data found - training without validation")
+
+        accum_steps = train_cfg.gradient_accumulation_steps
+        optimizer_steps_per_epoch = (steps_per_epoch + accum_steps - 1) // accum_steps
+        total_optimizer_steps = max(1, epochs * optimizer_steps_per_epoch)
+        self.scheduler = self._build_lr_scheduler(total_optimizer_steps)
+
         latest_ckpt = self.find_latest_checkpoint(out_dir)
         if latest_ckpt is not None:
             ckpt = self.load_checkpoint(latest_ckpt)
@@ -1189,15 +1243,6 @@ class SAM3TrainerNative:
         else:
             print_rank0(f"Starting training for {epochs} epochs...")
 
-        steps_per_epoch = len(train_loader)
-        print_rank0(f"Steps per epoch: {steps_per_epoch}")
-        if has_validation:
-            print_rank0(f"Training samples: {len(train_ds)}, Validation samples: {len(val_ds)}")
-        else:
-            print_rank0(f"Training samples: {len(train_ds)}")
-            print_rank0("No validation data found - training without validation")
-
-        accum_steps = train_cfg.gradient_accumulation_steps
         gpu_multiplier = self.world_size if self.multi_gpu else 1
         effective_bs = train_cfg.batch_size * accum_steps * gpu_multiplier
         print_rank0(
@@ -1215,6 +1260,85 @@ class SAM3TrainerNative:
             signal.signal(signal.SIGTERM, self._handle_shutdown)
         except OSError:
             pass
+
+        last_eval_step = -1
+
+        def run_validation(current_epoch: int, step_in_epoch: int, avg_train_loss: float) -> float:
+            nonlocal best_val_loss
+            self.model.eval()
+            val_losses = []
+
+            with torch.no_grad(), self._autocast_ctx():
+                val_pbar = tqdm(val_loader, desc="Validation", disable=not is_main_process())
+
+                for batch_dict in val_pbar:
+                    input_batch = batch_dict["input"]
+                    input_batch = move_to_device(input_batch, self.device)
+
+                    outputs_list = self.model(input_batch)
+                    find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+
+                    for targets in find_targets:
+                        for k, v in targets.items():
+                            if isinstance(v, torch.Tensor):
+                                targets[k] = v.to(self.device)
+
+                    with SAM3Output.iteration_mode(
+                        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                    ) as outputs_iter:
+                        for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                            stage_targets_list = [stage_targets] * len(stage_outputs)
+                            for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                outputs["indices"] = self.matcher(outputs, targets)
+                                if "aux_outputs" in outputs:
+                                    for aux_out in outputs["aux_outputs"]:
+                                        aux_out["indices"] = self.matcher(aux_out, targets)
+
+                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                    total_loss = loss_dict[CORE_LOSS_KEY]
+                    val_losses.append(total_loss.item())
+                    val_pbar.set_postfix({"val_loss": total_loss.item()})
+
+            avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float("inf")
+
+            if self.multi_gpu:
+                val_loss_tensor = torch.tensor([avg_val_loss], device=self.device)
+                dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                avg_val_loss = val_loss_tensor.item()
+
+            print_rank0(
+                f"\nEpoch {current_epoch+1}/{epochs} (global_step={global_step}) "
+                f"- Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+            )
+
+            if is_main_process():
+                model_to_save = self.model.module if self.multi_gpu else self.model
+                save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
+                    self.save_checkpoint(
+                        out_dir / "checkpoint_best.pt",
+                        current_epoch,
+                        global_step,
+                        step_in_epoch,
+                        best_val_loss,
+                    )
+                    print_rank0(f"New best model saved (val_loss: {avg_val_loss:.6f})")
+
+                with open(out_dir / "val_stats.json", "a") as f:
+                    f.write(json.dumps({
+                        "epoch": current_epoch + 1,
+                        "step_in_epoch": step_in_epoch,
+                        "global_step": global_step,
+                        "train_loss": avg_train_loss,
+                        "val_loss": avg_val_loss,
+                    }) + "\n")
+
+            torch.cuda.empty_cache()
+            self.model.train()
+            return avg_val_loss
 
         for epoch in range(start_epoch, epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
@@ -1268,9 +1392,37 @@ class SAM3TrainerNative:
 
                 is_accum_boundary = (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader)
                 if is_accum_boundary:
+                    if train_cfg.max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), train_cfg.max_grad_norm)
                     self.optimizer.step()
+                    if self.scheduler is not None:
+                        self.scheduler.step()
                     self.optimizer.zero_grad()
                     global_step += 1
+
+                    if is_main_process() and train_cfg.save_steps > 0 and global_step % train_cfg.save_steps == 0:
+                        self.save_checkpoint(
+                            out_dir / "checkpoint_epoch.pt",
+                            epoch,
+                            global_step,
+                            batch_idx + 1,
+                            best_val_loss,
+                        )
+
+                    if (
+                        has_validation
+                        and val_loader is not None
+                        and train_cfg.eval_steps > 0
+                        and global_step % train_cfg.eval_steps == 0
+                        and global_step != last_eval_step
+                    ):
+                        rolling_train_loss = sum(train_losses) / len(train_losses)
+                        run_validation(
+                            current_epoch=epoch,
+                            step_in_epoch=batch_idx + 1,
+                            avg_train_loss=rolling_train_loss,
+                        )
+                        last_eval_step = global_step
 
                 pbar.set_postfix({"loss": train_losses[-1], "step": global_step})
 
@@ -1289,75 +1441,13 @@ class SAM3TrainerNative:
 
             # Validation (only compute loss - no metrics, like SAM3)
             if has_validation and val_loader is not None:
-                self.model.eval()
-                val_losses = []
-
-                with torch.no_grad(), self._autocast_ctx():
-                    val_pbar = tqdm(val_loader, desc=f"Validation", disable=not is_main_process())
-
-                    for batch_dict in val_pbar:
-                        input_batch = batch_dict["input"]
-                        input_batch = move_to_device(input_batch, self.device)
-
-                        outputs_list = self.model(input_batch)
-
-                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
-
-                        for targets in find_targets:
-                            for k, v in targets.items():
-                                if isinstance(v, torch.Tensor):
-                                    targets[k] = v.to(self.device)
-
-                        with SAM3Output.iteration_mode(
-                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                        ) as outputs_iter:
-                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                                stage_targets_list = [stage_targets] * len(stage_outputs)
-                                for outputs, targets in zip(stage_outputs, stage_targets_list):
-                                    outputs["indices"] = self.matcher(outputs, targets)
-                                    if "aux_outputs" in outputs:
-                                        for aux_out in outputs["aux_outputs"]:
-                                            aux_out["indices"] = self.matcher(aux_out, targets)
-
-                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        total_loss = loss_dict[CORE_LOSS_KEY]
-
-                        val_losses.append(total_loss.item())
-                        val_pbar.set_postfix({"val_loss": total_loss.item()})
-
-                avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float("inf")
-
-                # Synchronize val_loss across all processes for consistent best model selection
-                if self.multi_gpu:
-                    val_loss_tensor = torch.tensor([avg_val_loss], device=self.device)
-                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
-                    avg_val_loss = val_loss_tensor.item()
-
-                print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-
-                if is_main_process():
-                    model_to_save = self.model.module if self.multi_gpu else self.model
-                    save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
-
-                    if avg_val_loss < best_val_loss:
-                        best_val_loss = avg_val_loss
-                        save_lora_weights(model_to_save, str(out_dir / "best_lora_weights.pt"))
-                        self.save_checkpoint(
-                            out_dir / "checkpoint_best.pt",
-                            epoch, global_step, 0, best_val_loss,
-                        )
-                        print(f"New best model saved (val_loss: {avg_val_loss:.6f})")
-
-                    with open(out_dir / "val_stats.json", "a") as f:
-                        f.write(json.dumps({
-                            "epoch": epoch + 1,
-                            "train_loss": avg_train_loss,
-                            "val_loss": avg_val_loss
-                        }) + "\n")
-
-                torch.cuda.empty_cache()
-
-                self.model.train()
+                if last_eval_step != global_step:
+                    run_validation(
+                        current_epoch=epoch,
+                        step_in_epoch=0,
+                        avg_train_loss=avg_train_loss,
+                    )
+                    last_eval_step = global_step
             else:
                 if is_main_process():
                     model_to_save = self.model.module if self.multi_gpu else self.model

@@ -90,6 +90,7 @@ toml
 torch
 torchmetrics
 torchvision
+optuna
 tqdm
 transformers
 typer

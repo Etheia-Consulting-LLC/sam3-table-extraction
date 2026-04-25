@@ -18,7 +18,7 @@ from sam3_table.cstone_train_sam3 import app, run_sweep, train_sam3
 from sweep import _deep_merge
 
 SHARED = {
-    "lora": {"rank": 4, "alpha": 8},
+    "lora": {"rank": 16, "alpha": 32},
     "training": {
         "num_epochs": 1,
         "learning_rate": 1e-4,
@@ -26,21 +26,17 @@ SHARED = {
         "batch_size": 8,
         "num_workers": 8,
         "gradient_accumulation_steps": 1,
+        "mixed_precision": "bf16",
     },
     "output": {
-        "output_dir": "outputs/ab_testing/mixed_precision",
+        "output_dir": "outputs/ab_testing/base",
     },
 }
 
 
 def build_test_sweep_configs(base_config: SAM3LoRAConfig) -> list[dict]:
     sweep_params = [
-        {**SHARED, "training": {**SHARED["training"], "mixed_precision": "bf16"}},
-        {**SHARED, "training": {**SHARED["training"], "mixed_precision": "no"}},
-        {**SHARED, "training": {**SHARED["training"], "mixed_precision": "bf16"}},
-        {**SHARED, "training": {**SHARED["training"], "mixed_precision": "no"}},
-        {**SHARED, "training": {**SHARED["training"], "mixed_precision": "bf16"}},
-        {**SHARED, "training": {**SHARED["training"], "mixed_precision": "no"}},
+        {**SHARED, "training": {**SHARED["training"]}},
     ]
 
     configs = []
