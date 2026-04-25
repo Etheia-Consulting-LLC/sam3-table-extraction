@@ -83,7 +83,7 @@ def _find_resumable_run(config_dict: dict) -> Path | None:
 
 
 @app.function(
-    gpu="H200",
+    gpu="RTX-PRO-6000",
     image=image,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={MODAL_DATA_DIR: data_vol, MODAL_ARTIFACTS_DIR: artifacts_vol},

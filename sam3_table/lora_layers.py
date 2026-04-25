@@ -270,6 +270,34 @@ class LoRALinear(nn.Module):
         return self.original_layer(x) + self.lora(x)
 
 
+class FusedQKVLoRALinear(LoRALinear):
+    """
+    LoRA wrapper for fused QKV projections.
+
+    Keeps the original fused W_qkv matmul intact and adds a fused LoRA residual:
+      x @ W_qkv + (x @ A @ B), where A: D->r and B: r->(3D).
+    """
+
+    def __init__(
+        self,
+        original_layer: nn.Linear,
+        rank: int = 8,
+        alpha: int = 16,
+        dropout: float = 0.0,
+    ):
+        if original_layer.out_features % 3 != 0:
+            raise ValueError(
+                "FusedQKVLoRALinear expects out_features to be a multiple of 3 "
+                f"(got {original_layer.out_features})."
+            )
+        super().__init__(
+            original_layer=original_layer,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+
+
 class LoRAConfig:
     """
     Configuration for LoRA application to SAM3 model.
@@ -457,13 +485,22 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
             for p in parent_path:
                 parent = getattr(parent, p)
 
-            # Replace with LoRA linear
-            lora_linear = LoRALinear(
-                module,
-                rank=config.rank,
-                alpha=config.alpha,
-                dropout=config.dropout,
-            )
+            module_basename = name.split(".")[-1]
+            # Keep fused qkv path intact with a fused D->r->3D LoRA residual.
+            if module_basename == "qkv":
+                lora_linear = FusedQKVLoRALinear(
+                    module,
+                    rank=config.rank,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
+            else:
+                lora_linear = LoRALinear(
+                    module,
+                    rank=config.rank,
+                    alpha=config.alpha,
+                    dropout=config.dropout,
+                )
             setattr(parent, attr_name, lora_linear)
             lora_modules_applied.append(name)
 

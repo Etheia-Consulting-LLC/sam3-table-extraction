@@ -85,13 +85,14 @@ training:
   lr_scheduler: "cosine"
 
   logging_steps: 10
-  eval_steps: 100       # More frequent validation (from 500)
-  save_steps: 100       # More frequent checkpoints (from 1000)
+  eval_steps: 1000000       # More frequent validation (from 500) # disabled for budget
+  save_steps: 1000000       # More frequent checkpoints (from 1000) # disabled
   save_total_limit: 5   # Keep more checkpoints
 
   mixed_precision: "bf16"    # Use bfloat16 if available
   seed: 42
   gradient_accumulation_steps: 1  # effective batch: 8×1=8
+  val_batch_size: 16              # larger val batch improves validation GPU utilization
 
 output:
   output_dir: "outputs/sam3_lora_full"
@@ -109,3 +110,6 @@ hardware:
   device: "cuda"
   dataloader_pin_memory: true
   use_compile: false
+  cudnn_benchmark: true
+  allow_tf32: true
+  float32_matmul_precision: "high"

@@ -27,6 +27,7 @@ import json
 import signal
 import urllib.request
 import math
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -68,6 +69,9 @@ BPE_VOCAB_URL = "https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.t
 BPE_CACHE_PATH = Path("/tmp/bpe_simple_vocab_16e6.txt.gz")
 
 CHECKPOINT_NAMES = ("checkpoint_epoch.pt", "checkpoint_best.pt", "checkpoint_signal.pt")
+CKPT_PHASE_TRAIN_IN_EPOCH = "train_in_epoch"
+CKPT_PHASE_PRE_END_EPOCH_VALIDATION = "pre_end_epoch_validation"
+CKPT_PHASE_EPOCH_COMPLETE = "epoch_complete"
 
 
 # ============================================================================
@@ -375,6 +379,11 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
     binary_masks = binary_masks[sorted_indices]
     scores = scores[sorted_indices]
     boxes = boxes[sorted_indices]
+    binary_masks = binary_masks.to(dtype=torch.bool).cpu()
+    encoded_masks = [
+        mask_utils.encode(np.asfortranarray(mask.numpy().astype(np.uint8)))
+        for mask in binary_masks
+    ]
 
     merged_masks = []
     merged_scores = []
@@ -388,6 +397,7 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
         current_mask = binary_masks[i].clone()
         current_score = scores[i].item()
         current_box = boxes[i]
+        current_rle = encoded_masks[i]
         used[i] = True
 
         # Find overlapping masks and merge them
@@ -395,14 +405,13 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
             if used[j]:
                 continue
 
-            # Compute IoU
-            intersection = (current_mask & binary_masks[j]).sum().item()
-            union = (current_mask | binary_masks[j]).sum().item()
-            iou = intersection / union if union > 0 else 0
+            # Compute mask IoU using pycocotools implementation.
+            iou = float(mask_utils.iou([current_rle], [encoded_masks[j]], [0])[0][0])
 
             # If overlaps significantly, merge it
             if iou > iou_threshold:
                 current_mask = current_mask | binary_masks[j]
+                current_rle = mask_utils.encode(np.asfortranarray(current_mask.numpy().astype(np.uint8)))
                 current_score = max(current_score, scores[j].item())
                 used[j] = True
 
@@ -412,7 +421,7 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
 
     if len(merged_masks) > 0:
         merged_masks = torch.stack(merged_masks)
-        merged_scores = torch.tensor(merged_scores, device=scores.device)
+        merged_scores = torch.tensor(merged_scores, device=scores.device, dtype=scores.dtype)
         merged_boxes = torch.stack(merged_boxes)
     else:
         merged_masks = binary_masks[:0]
@@ -660,9 +669,8 @@ def convert_predictions_to_coco_format_original_res(predictions_list, image_ids,
 
         binary_masks = (masks_upsampled > 0.5).cpu()
 
-        # Free GPU memory immediately after upsampling
+        # Free temporary tensors after upsampling.
         del masks_sigmoid, masks_upsampled
-        torch.cuda.empty_cache()
 
         # Merge overlapping predictions
         if merge_overlaps and len(binary_masks) > 0:
@@ -841,6 +849,19 @@ class SAM3TrainerNative:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        if self.device.type == "cuda":
+            hw_cfg = self.config.hardware
+            torch.backends.cudnn.benchmark = hw_cfg.cudnn_benchmark
+            torch.backends.cuda.matmul.allow_tf32 = hw_cfg.allow_tf32
+            torch.backends.cudnn.allow_tf32 = hw_cfg.allow_tf32
+            torch.set_float32_matmul_precision(hw_cfg.float32_matmul_precision)
+            print_rank0(
+                "CUDA perf settings: "
+                f"cudnn_benchmark={torch.backends.cudnn.benchmark}, "
+                f"allow_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+                f"float32_matmul_precision={hw_cfg.float32_matmul_precision}"
+            )
+
         # Build Model
         print_rank0("Building SAM3 model...")
         self.model = build_sam3_image_model(
@@ -962,8 +983,15 @@ class SAM3TrainerNative:
             normalize_by_valid_object_num=False,
         )
         
-    def save_checkpoint(self, path: Path, epoch: int, global_step: int,
-                        step_in_epoch: int, best_val_loss: float):
+    def save_checkpoint(
+        self,
+        path: Path,
+        epoch: int,
+        global_step: int,
+        step_in_epoch: int,
+        best_val_loss: float,
+        checkpoint_phase: str = CKPT_PHASE_TRAIN_IN_EPOCH,
+    ):
         """Persist full training state so a run can resume after interruption.
 
         Args:
@@ -971,8 +999,12 @@ class SAM3TrainerNative:
             epoch: Current epoch (0-indexed).
             global_step: Total batches processed across all epochs.
             step_in_epoch: Batches processed in the current epoch.
-                           0 means the epoch finished completely.
+                           0 is only unambiguous when paired with checkpoint_phase.
             best_val_loss: Best validation loss observed so far.
+            checkpoint_phase:
+                - train_in_epoch: regular training state
+                - pre_end_epoch_validation: captured right before validation
+                - epoch_complete: epoch train+validation complete
         """
         model_to_save = self.model.module if self.multi_gpu else self.model
         lora_state = {}
@@ -985,12 +1017,16 @@ class SAM3TrainerNative:
             "global_step": global_step,
             "step_in_epoch": step_in_epoch,
             "best_val_loss": best_val_loss,
+            "checkpoint_phase": checkpoint_phase,
             "lora_state_dict": lora_state,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler is not None else None,
         }
         torch.save(checkpoint, path)
-        print_rank0(f"Checkpoint saved to {path} (epoch {epoch + 1}, global_step {global_step})")
+        print_rank0(
+            f"Checkpoint saved to {path} (epoch {epoch + 1}, global_step {global_step}, "
+            f"phase={checkpoint_phase})"
+        )
         if self._on_checkpoint is not None:
             try:
                 self._on_checkpoint()
@@ -1008,10 +1044,16 @@ class SAM3TrainerNative:
             self.scheduler.load_state_dict(scheduler_state)
         gs = checkpoint.get("global_step", 0)
         sie = checkpoint.get("step_in_epoch", 0)
+        phase = checkpoint.get("checkpoint_phase")
+        if phase is None:
+            # Backward-compatibility for older checkpoints.
+            phase = CKPT_PHASE_EPOCH_COMPLETE if sie == 0 else CKPT_PHASE_TRAIN_IN_EPOCH
+            checkpoint["checkpoint_phase"] = phase
         print_rank0(
             f"Resumed from {path.name} "
             f"(epoch {checkpoint['epoch'] + 1}, global_step={gs}, "
-            f"step_in_epoch={sie}, best_val_loss={checkpoint['best_val_loss']:.6f})"
+            f"step_in_epoch={sie}, phase={phase}, "
+            f"best_val_loss={checkpoint['best_val_loss']:.6f})"
         )
         return checkpoint
 
@@ -1037,11 +1079,16 @@ class SAM3TrainerNative:
     def _handle_shutdown(self, signum, frame):
         """Signal handler that requests a graceful checkpoint-and-exit."""
         if self._shutdown_requested:
-            print_rank0("\nForced shutdown.")
-            raise SystemExit(1)
+            # Ignore repeated signals so we can finish the in-flight batch
+            # and persist a checkpoint instead of exiting immediately.
+            print_rank0("\nShutdown already requested; waiting to save checkpoint...")
+            return
         self._shutdown_requested = True
         sig_name = signal.Signals(signum).name
         print_rank0(f"\n{sig_name} received. Will save checkpoint after current batch...")
+        signal_out_dir = getattr(self, "_signal_output_dir", None)
+        if signal_out_dir is not None:
+            print_rank0(f"Signal artifacts directory: {Path(signal_out_dir).resolve()}")
 
     def _build_lr_scheduler(self, total_optimizer_steps: int) -> LambdaLR | None:
         train_cfg = self.config.training
@@ -1078,7 +1125,14 @@ class SAM3TrainerNative:
     def train(self):
         train_cfg = self.config.training
         sample_pct = train_cfg.data.sample_percent
+        val_sample_pct = train_cfg.data.valid_sample_percent
+        val_sample_seed = train_cfg.data.valid_sample_seed
         seed = train_cfg.seed
+
+        print_rank0(
+            f"Data sampling: train={sample_pct:.1f}% "
+            f"| valid={val_sample_pct:.1f}% (seed={val_sample_seed})"
+        )
 
         if self.train_coco_dataset is not None:
             print_rank0("\nLoading training data from passed train_coco_dataset...")
@@ -1104,8 +1158,8 @@ class SAM3TrainerNative:
             val_ds = COCOSegmentDataset(
                 self.val_coco_dataset,
                 image_dir=val_image_dir,
-                sample_percent=sample_pct,
-                seed=seed,
+                sample_percent=val_sample_pct,
+                seed=val_sample_seed,
             )
             if len(val_ds) > 0:
                 has_validation = True
@@ -1117,7 +1171,7 @@ class SAM3TrainerNative:
             print_rank0("\nLoading validation data from config paths...")
             try:
                 val_ds = COCOSegmentDataset.from_split_config(
-                    train_cfg.data.valid, sample_percent=sample_pct, seed=seed,
+                    train_cfg.data.valid, sample_percent=val_sample_pct, seed=val_sample_seed,
                 )
                 if len(val_ds) > 0:
                     has_validation = True
@@ -1158,13 +1212,14 @@ class SAM3TrainerNative:
             num_workers=train_cfg.num_workers,
             pin_memory=self.config.hardware.dataloader_pin_memory,
             persistent_workers=persistent,
-            prefetch_factor=2 if train_cfg.num_workers > 0 else None,
+            prefetch_factor=4 if train_cfg.num_workers > 0 else None,
         )
 
         if has_validation:
+            val_batch_size = train_cfg.val_batch_size or train_cfg.batch_size
             val_loader = DataLoader(
                 val_ds,
-                batch_size=train_cfg.batch_size,
+                batch_size=val_batch_size,
                 shuffle=False,
                 sampler=val_sampler,
                 collate_fn=collate_fn,
@@ -1192,11 +1247,14 @@ class SAM3TrainerNative:
         start_epoch = 0
         resume_step_in_epoch = 0
         global_step = 0
+        resume_checkpoint_phase = CKPT_PHASE_TRAIN_IN_EPOCH
+        pending_resume_validation_epoch = None
+        pending_resume_validation_step = None
 
         # Helper to move BatchedDatapoint to device
         def move_to_device(obj, device):
             if isinstance(obj, torch.Tensor):
-                return obj.to(device)
+                return obj.to(device, non_blocking=True)
             elif isinstance(obj, list):
                 return [move_to_device(x, device) for x in obj]
             elif isinstance(obj, tuple):
@@ -1212,6 +1270,7 @@ class SAM3TrainerNative:
 
         out_dir = Path(self.config.output.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
+        self._signal_output_dir = str(out_dir.resolve())
 
         steps_per_epoch = len(train_loader)
         print_rank0(f"Steps per epoch: {steps_per_epoch}")
@@ -1232,7 +1291,16 @@ class SAM3TrainerNative:
             best_val_loss = ckpt["best_val_loss"]
             global_step = ckpt.get("global_step", 0)
             resume_step_in_epoch = ckpt.get("step_in_epoch", 0)
-            if resume_step_in_epoch == 0:
+            resume_checkpoint_phase = ckpt.get("checkpoint_phase", CKPT_PHASE_TRAIN_IN_EPOCH)
+            if resume_checkpoint_phase == CKPT_PHASE_PRE_END_EPOCH_VALIDATION:
+                pending_resume_validation_epoch = ckpt["epoch"]
+                pending_resume_validation_step = resume_step_in_epoch
+                start_epoch = ckpt["epoch"]
+                print_rank0(
+                    "Detected checkpoint captured before validation; "
+                    f"will replay validation for epoch {pending_resume_validation_epoch + 1}."
+                )
+            elif resume_step_in_epoch == 0:
                 start_epoch = ckpt["epoch"] + 1
             else:
                 start_epoch = ckpt["epoch"]
@@ -1262,53 +1330,134 @@ class SAM3TrainerNative:
             pass
 
         last_eval_step = -1
+        log_every_steps = 20
 
-        def run_validation(current_epoch: int, step_in_epoch: int, avg_train_loss: float) -> float:
+        def save_signal_checkpoint(
+            current_epoch: int,
+            step_in_epoch: int,
+            checkpoint_phase: str = CKPT_PHASE_TRAIN_IN_EPOCH,
+        ) -> None:
+            if not is_main_process():
+                return
+            signal_ckpt_path = out_dir / "checkpoint_signal.pt"
+            print_rank0(f"Saving signal checkpoint before exit: {signal_ckpt_path}")
+            self.save_checkpoint(
+                signal_ckpt_path,
+                current_epoch,
+                global_step,
+                step_in_epoch,
+                best_val_loss,
+                checkpoint_phase=checkpoint_phase,
+            )
+            print_rank0(
+                f"Signal checkpoint saved at: {signal_ckpt_path} "
+                f"(artifacts dir: {out_dir.resolve()}). Exiting training loop."
+            )
+
+        def save_pre_validation_checkpoint(current_epoch: int, step_in_epoch: int) -> None:
+            """Persist state before long validation so abrupt app stops remain resumable."""
+            if not is_main_process():
+                return
+            self.save_checkpoint(
+                out_dir / "checkpoint_epoch.pt",
+                current_epoch,
+                global_step,
+                step_in_epoch,
+                best_val_loss,
+                checkpoint_phase=CKPT_PHASE_PRE_END_EPOCH_VALIDATION,
+            )
+
+        def run_validation(current_epoch: int, step_in_epoch: int, avg_train_loss: float) -> tuple[float, bool]:
             nonlocal best_val_loss
             self.model.eval()
-            val_losses = []
+            val_loss_sum = torch.zeros(1, device=self.device)
+            val_batch_count = 0
+            val_start_time = time.perf_counter()
+            interval_data_wait_sec = 0.0
+            interval_compute_sec = 0.0
+            interval_steps = 0
+            last_val_iter_end_time = time.perf_counter()
+            val_batch_size = train_cfg.val_batch_size or train_cfg.batch_size
 
-            with torch.no_grad(), self._autocast_ctx():
+            with torch.no_grad():
                 val_pbar = tqdm(val_loader, desc="Validation", disable=not is_main_process())
 
-                for batch_dict in val_pbar:
+                for val_batch_idx, batch_dict in enumerate(val_pbar):
+                    if self._shutdown_requested:
+                        save_signal_checkpoint(
+                            current_epoch,
+                            step_in_epoch,
+                            checkpoint_phase=CKPT_PHASE_PRE_END_EPOCH_VALIDATION,
+                        )
+                        return float((val_loss_sum / max(1, val_batch_count)).item()), True
+
+                    val_iter_entry_time = time.perf_counter()
+                    interval_data_wait_sec += val_iter_entry_time - last_val_iter_end_time
                     input_batch = batch_dict["input"]
                     input_batch = move_to_device(input_batch, self.device)
 
-                    outputs_list = self.model(input_batch)
-                    find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                    with self._autocast_ctx():
+                        outputs_list = self.model(input_batch)
+                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
-                    for targets in find_targets:
-                        for k, v in targets.items():
-                            if isinstance(v, torch.Tensor):
-                                targets[k] = v.to(self.device)
+                        for targets in find_targets:
+                            for k, v in targets.items():
+                                if isinstance(v, torch.Tensor):
+                                    targets[k] = v.to(self.device, non_blocking=True)
 
-                    with SAM3Output.iteration_mode(
-                        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                    ) as outputs_iter:
-                        for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                            stage_targets_list = [stage_targets] * len(stage_outputs)
-                            for outputs, targets in zip(stage_outputs, stage_targets_list):
-                                outputs["indices"] = self.matcher(outputs, targets)
-                                if "aux_outputs" in outputs:
-                                    for aux_out in outputs["aux_outputs"]:
-                                        aux_out["indices"] = self.matcher(aux_out, targets)
+                        with SAM3Output.iteration_mode(
+                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                        ) as outputs_iter:
+                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                                stage_targets_list = [stage_targets] * len(stage_outputs)
+                                for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                    outputs["indices"] = self.matcher(outputs, targets)
+                                    if "aux_outputs" in outputs:
+                                        for aux_out in outputs["aux_outputs"]:
+                                            aux_out["indices"] = self.matcher(aux_out, targets)
 
-                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                    total_loss = loss_dict[CORE_LOSS_KEY]
-                    val_losses.append(total_loss.item())
-                    val_pbar.set_postfix({"val_loss": total_loss.item()})
+                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                        total_loss = loss_dict[CORE_LOSS_KEY]
+                    val_loss_sum += total_loss.detach()
+                    val_batch_count += 1
+                    interval_compute_sec += time.perf_counter() - val_iter_entry_time
+                    interval_steps += 1
 
-            avg_val_loss = sum(val_losses) / len(val_losses) if val_losses else float("inf")
+                    if is_main_process() and (val_batch_idx + 1) % log_every_steps == 0:
+                        avg_data_wait = interval_data_wait_sec / max(1, interval_steps)
+                        avg_compute = interval_compute_sec / max(1, interval_steps)
+                        interval_imgs_per_sec = (
+                            interval_steps * val_batch_size * gpu_multiplier
+                        ) / max(interval_data_wait_sec + interval_compute_sec, 1e-6)
+                        val_pbar.set_postfix(
+                            {
+                                "val_loss": float((val_loss_sum / val_batch_count).item()),
+                                "val_step": val_batch_idx + 1,
+                                "data_wait_s": f"{avg_data_wait:.2f}",
+                                "compute_s": f"{avg_compute:.2f}",
+                                "val_imgs_s": f"{interval_imgs_per_sec:.2f}",
+                            }
+                        )
+                        interval_data_wait_sec = 0.0
+                        interval_compute_sec = 0.0
+                        interval_steps = 0
+
+                    last_val_iter_end_time = time.perf_counter()
+
+            avg_val_loss = float((val_loss_sum / max(1, val_batch_count)).item())
 
             if self.multi_gpu:
                 val_loss_tensor = torch.tensor([avg_val_loss], device=self.device)
                 dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                 avg_val_loss = val_loss_tensor.item()
+            val_elapsed_sec = time.perf_counter() - val_start_time
+            val_batch_size = train_cfg.val_batch_size or train_cfg.batch_size
+            val_imgs_per_sec = (val_batch_count * val_batch_size * gpu_multiplier) / max(val_elapsed_sec, 1e-6)
 
             print_rank0(
                 f"\nEpoch {current_epoch+1}/{epochs} (global_step={global_step}) "
-                f"- Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}"
+                f"- Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, "
+                f"Val Time: {val_elapsed_sec:.1f}s, Val Throughput: {val_imgs_per_sec:.2f} imgs/s"
             )
 
             if is_main_process():
@@ -1324,6 +1473,7 @@ class SAM3TrainerNative:
                         global_step,
                         step_in_epoch,
                         best_val_loss,
+                        checkpoint_phase=CKPT_PHASE_TRAIN_IN_EPOCH,
                     )
                     print_rank0(f"New best model saved (val_loss: {avg_val_loss:.6f})")
 
@@ -1336,17 +1486,48 @@ class SAM3TrainerNative:
                         "val_loss": avg_val_loss,
                     }) + "\n")
 
-            torch.cuda.empty_cache()
             self.model.train()
-            return avg_val_loss
+            return avg_val_loss, False
+
+        # If the latest checkpoint was captured before a validation pass, replay
+        # that validation before proceeding so no validation event is lost.
+        if (
+            has_validation
+            and val_loader is not None
+            and pending_resume_validation_epoch is not None
+            and pending_resume_validation_step is not None
+        ):
+            print_rank0(
+                "Replaying interrupted validation pass from checkpoint metadata."
+            )
+            _, interrupted = run_validation(
+                current_epoch=pending_resume_validation_epoch,
+                step_in_epoch=pending_resume_validation_step,
+                avg_train_loss=float("nan"),
+            )
+            if interrupted:
+                return
+            last_eval_step = global_step
+
+            if pending_resume_validation_step == 0:
+                # End-of-epoch validation has now completed; continue with next epoch.
+                start_epoch = pending_resume_validation_epoch + 1
+                resume_step_in_epoch = 0
 
         for epoch in range(start_epoch, epochs):
+            epoch_start_time = time.perf_counter()
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
-            # Track training losses for this epoch
-            train_losses = []
+            # Track training losses for this epoch without per-step host sync.
+            train_loss_sum = torch.zeros(1, device=self.device)
+            train_loss_count = 0
+            # Lightweight runtime breakdown to identify bottlenecks.
+            interval_data_wait_sec = 0.0
+            interval_compute_sec = 0.0
+            interval_steps = 0
+            last_iter_end_time = time.perf_counter()
 
             skip_to = resume_step_in_epoch if epoch == start_epoch else 0
             if skip_to > 0:
@@ -1356,7 +1537,11 @@ class SAM3TrainerNative:
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process())
             for batch_idx, batch_dict in enumerate(pbar):
+                iter_entry_time = time.perf_counter()
+                interval_data_wait_sec += iter_entry_time - last_iter_end_time
+
                 if batch_idx < skip_to:
+                    last_iter_end_time = time.perf_counter()
                     continue
 
                 input_batch = batch_dict["input"]
@@ -1364,31 +1549,33 @@ class SAM3TrainerNative:
 
                 with self._autocast_ctx():
                     outputs_list = self.model(input_batch)
+                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
-                    find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                for targets in find_targets:
+                    for k, v in targets.items():
+                        if isinstance(v, torch.Tensor):
+                            targets[k] = v.to(self.device, non_blocking=True)
 
-                    for targets in find_targets:
-                        for k, v in targets.items():
-                            if isinstance(v, torch.Tensor):
-                                targets[k] = v.to(self.device)
+                with SAM3Output.iteration_mode(
+                    outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                ) as outputs_iter:
+                    for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                        stage_targets_list = [stage_targets] * len(stage_outputs)
+                        for outputs, targets in zip(stage_outputs, stage_targets_list):
+                            outputs["indices"] = self.matcher(outputs, targets)
+                            if "aux_outputs" in outputs:
+                                for aux_out in outputs["aux_outputs"]:
+                                    aux_out["indices"] = self.matcher(aux_out, targets)
 
-                    with SAM3Output.iteration_mode(
-                        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                    ) as outputs_iter:
-                        for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                            stage_targets_list = [stage_targets] * len(stage_outputs)
-                            for outputs, targets in zip(stage_outputs, stage_targets_list):
-                                outputs["indices"] = self.matcher(outputs, targets)
-                                if "aux_outputs" in outputs:
-                                    for aux_out in outputs["aux_outputs"]:
-                                        aux_out["indices"] = self.matcher(aux_out, targets)
-
-                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                    total_loss = loss_dict[CORE_LOSS_KEY] / accum_steps
+                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                total_loss = loss_dict[CORE_LOSS_KEY] / accum_steps
 
                 total_loss.backward()
 
-                train_losses.append(total_loss.item() * accum_steps)
+                train_loss_sum += (total_loss.detach() * accum_steps)
+                train_loss_count += 1
+                interval_compute_sec += time.perf_counter() - iter_entry_time
+                interval_steps += 1
 
                 is_accum_boundary = (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader)
                 if is_accum_boundary:
@@ -1400,6 +1587,21 @@ class SAM3TrainerNative:
                     self.optimizer.zero_grad()
                     global_step += 1
 
+                    if is_main_process() and global_step % log_every_steps == 0:
+                        avg_data_wait = interval_data_wait_sec / max(1, interval_steps)
+                        avg_compute = interval_compute_sec / max(1, interval_steps)
+                        pbar.set_postfix(
+                            {
+                                "loss": float((train_loss_sum / max(1, train_loss_count)).item()),
+                                "step": global_step,
+                                "data_wait_s": f"{avg_data_wait:.2f}",
+                                "compute_s": f"{avg_compute:.2f}",
+                            }
+                        )
+                        interval_data_wait_sec = 0.0
+                        interval_compute_sec = 0.0
+                        interval_steps = 0
+
                     if is_main_process() and train_cfg.save_steps > 0 and global_step % train_cfg.save_steps == 0:
                         self.save_checkpoint(
                             out_dir / "checkpoint_epoch.pt",
@@ -1407,6 +1609,7 @@ class SAM3TrainerNative:
                             global_step,
                             batch_idx + 1,
                             best_val_loss,
+                            checkpoint_phase=CKPT_PHASE_TRAIN_IN_EPOCH,
                         )
 
                     if (
@@ -1416,37 +1619,44 @@ class SAM3TrainerNative:
                         and global_step % train_cfg.eval_steps == 0
                         and global_step != last_eval_step
                     ):
-                        rolling_train_loss = sum(train_losses) / len(train_losses)
-                        run_validation(
+                        rolling_train_loss = float((train_loss_sum / max(1, train_loss_count)).item())
+                        save_pre_validation_checkpoint(epoch, batch_idx + 1)
+                        _, interrupted = run_validation(
                             current_epoch=epoch,
                             step_in_epoch=batch_idx + 1,
                             avg_train_loss=rolling_train_loss,
                         )
+                        if interrupted:
+                            return
                         last_eval_step = global_step
-
-                pbar.set_postfix({"loss": train_losses[-1], "step": global_step})
 
                 # Graceful shutdown on SIGINT / SIGTERM: save mid-epoch checkpoint
                 if self._shutdown_requested and is_main_process():
-                    print_rank0("Saving signal checkpoint before exit...")
-                    self.save_checkpoint(
-                        out_dir / "checkpoint_signal.pt",
-                        epoch, global_step, batch_idx + 1, best_val_loss,
-                    )
-                    print_rank0("Signal checkpoint saved. Exiting training loop.")
+                    save_signal_checkpoint(epoch, batch_idx + 1)
                     return
 
+                last_iter_end_time = time.perf_counter()
+
             # Calculate average training loss for this epoch
-            avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
+            avg_train_loss = float((train_loss_sum / max(1, train_loss_count)).item())
+            epoch_elapsed_sec = time.perf_counter() - epoch_start_time
+            approx_samples = train_loss_count * train_cfg.batch_size * gpu_multiplier
+            samples_per_sec = approx_samples / max(epoch_elapsed_sec, 1e-6)
 
             # Validation (only compute loss - no metrics, like SAM3)
             if has_validation and val_loader is not None:
-                if last_eval_step != global_step:
-                    run_validation(
+                should_run_epoch_eval = (
+                    ((epoch + 1) % train_cfg.eval_every_n_epochs == 0) or ((epoch + 1) == epochs)
+                )
+                if should_run_epoch_eval and last_eval_step != global_step:
+                    save_pre_validation_checkpoint(epoch, 0)
+                    _, interrupted = run_validation(
                         current_epoch=epoch,
                         step_in_epoch=0,
                         avg_train_loss=avg_train_loss,
                     )
+                    if interrupted:
+                        return
                     last_eval_step = global_step
             else:
                 if is_main_process():
@@ -1457,7 +1667,15 @@ class SAM3TrainerNative:
             if is_main_process():
                 self.save_checkpoint(
                     out_dir / "checkpoint_epoch.pt",
-                    epoch, global_step, 0, best_val_loss,
+                    epoch,
+                    global_step,
+                    0,
+                    best_val_loss,
+                    checkpoint_phase=CKPT_PHASE_EPOCH_COMPLETE,
+                )
+                print_rank0(
+                    f"Epoch {epoch+1} timing: {epoch_elapsed_sec:.1f}s, "
+                    f"approx throughput: {samples_per_sec:.2f} samples/s"
                 )
 
         # Restore original signal handlers
@@ -1501,12 +1719,9 @@ class SAM3TrainerNative:
                 print(f"\nNo validation data - consider adding data/valid/ for better model selection")
                 print(f"{'='*80}")
 
-            # Clean up all checkpoint files (training complete, no longer resumable)
-            for ckpt_name in CHECKPOINT_NAMES:
-                ckpt_path = out_dir / ckpt_name
-                if ckpt_path.exists():
-                    ckpt_path.unlink()
-            print_rank0("Removed checkpoint files (training complete).")
+            # Keep checkpoints so staged sweeps can resume across successive runs.
+            # Artifact retention can be handled by a separate cleanup policy/job.
+            print_rank0("Keeping checkpoint files for potential resume/chained stages.")
 
         if self.multi_gpu:
             cleanup_distributed()

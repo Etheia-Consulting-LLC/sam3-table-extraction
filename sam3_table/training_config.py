@@ -89,13 +89,26 @@ class DataConfig(BaseModel):
     valid: Optional[DatasetSplit] = None
     sample_percent: float = Field(
         100.0, gt=0.0, le=100.0,
-        description="Percentage of each split to use (e.g. 10.0 = 10%)",
+        description="Percentage of TRAIN split to use (e.g. 10.0 = 10%)",
+    )
+    valid_sample_percent: float = Field(
+        100.0, gt=0.0, le=100.0,
+        description="Percentage of VALID split to use (fixed holdout subset if <100)",
+    )
+    valid_sample_seed: int = Field(
+        42,
+        description="Seed used when subsampling the VALID split for deterministic holdouts",
     )
 
 
 class TrainingConfig(BaseModel):
     data: DataConfig
     batch_size: int = Field(4, gt=0)
+    val_batch_size: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Validation batch size override. Uses batch_size when unset.",
+    )
     num_workers: int = Field(2, ge=0)
 
     learning_rate: float = Field(5e-5, gt=0)
@@ -111,6 +124,11 @@ class TrainingConfig(BaseModel):
 
     logging_steps: int = Field(10, gt=0)
     eval_steps: int = Field(100, gt=0)
+    eval_every_n_epochs: int = Field(
+        1,
+        gt=0,
+        description="Run end-of-epoch validation every N epochs (always runs on final epoch).",
+    )
     save_steps: int = Field(100, gt=0)
     save_total_limit: int = Field(5, gt=0)
 
@@ -148,6 +166,20 @@ class HardwareConfig(BaseModel):
     device: Device = Device.CUDA
     dataloader_pin_memory: bool = True
     use_compile: bool = False
+    cudnn_benchmark: bool = True
+    allow_tf32: bool = True
+    float32_matmul_precision: str = Field(
+        "high",
+        description="torch.set_float32_matmul_precision value: highest, high, or medium",
+    )
+
+    @field_validator("float32_matmul_precision")
+    @classmethod
+    def matmul_precision_must_be_valid(cls, v: str) -> str:
+        allowed = {"highest", "high", "medium"}
+        if v not in allowed:
+            raise ValueError(f"float32_matmul_precision must be one of {sorted(allowed)}")
+        return v
 
 
 class SAM3LoRAConfig(BaseModel):

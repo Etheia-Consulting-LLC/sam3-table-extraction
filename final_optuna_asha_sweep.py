@@ -24,6 +24,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import modal
 import optuna
@@ -35,7 +36,216 @@ from sam3_table.cstone_train_sam3 import (
     train_sam3,
 )
 from sam3_table.training_config import SAM3LoRAConfig
-from sweep import _deep_merge
+
+# Checkpoint filenames written by `train_sam3`. Kept in sync with
+# `sam3_table.cstone_train_sam3.CHECKPOINT_NAMES` -- duplicated here so the
+# salvage helper below doesn't need to import a private-ish module constant.
+_RESUMABLE_CHECKPOINT_FILES = (
+    "checkpoint_epoch.pt",
+    "checkpoint_best.pt",
+    "checkpoint_signal.pt",
+)
+
+
+def _deep_merge(base: dict, overrides: dict) -> dict:
+    """Recursively merge overrides into base (mutates and returns base)."""
+    for key, value in overrides.items():
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _commit_artifacts_volume_safely(context: str) -> None:
+    """Commit the artifacts volume so other containers (e.g. a live leader
+    monitor / benchmark) see the latest Optuna sqlite + checkpoint state.
+
+    Never raises: if the commit fails (transient network hiccup, etc.) we
+    log and continue so a sweep isn't killed by an ancillary sync step.
+    """
+    try:
+        artifacts_vol.commit()
+    except Exception as exc:  # pragma: no cover - best-effort sync
+        print(f"[sweep] artifacts_vol.commit() failed ({context}): {exc}")
+
+
+def _close_optuna_storage(study: "optuna.study.Study | None") -> None:
+    """Dispose Optuna's SQLAlchemy engine so the underlying sqlite file
+    is no longer held open.
+
+    Modal's ``Volume.reload()`` refuses to operate while any file in the
+    volume is open. After ``study.optimize()`` returns, Optuna's engine
+    still has ``/artifacts/optuna/<study>.db`` open, which triggers
+    ``ConflictError("there are open files preventing the operation: path
+    optuna/<study>.db is open")``. ``engine.dispose()`` closes all pooled
+    connections; later reads from the same ``study`` object will silently
+    open fresh connections (which is fine -- by then the reload has
+    completed).
+    """
+    if study is None:
+        return
+    import gc
+
+    storage = getattr(study, "_storage", None)
+    if storage is None:
+        return
+
+    engine = None
+    for attr_chain in (
+        ("engine",),
+        ("_backend", "engine"),
+        ("scoped_session", "bind"),
+    ):
+        obj = storage
+        try:
+            for attr in attr_chain:
+                obj = getattr(obj, attr)
+            engine = obj
+            break
+        except AttributeError:
+            continue
+    if engine is not None and hasattr(engine, "dispose"):
+        try:
+            engine.dispose()
+        except Exception as exc:  # pragma: no cover - best-effort sync
+            print(f"[sweep] optuna engine.dispose() failed: {exc}")
+    if hasattr(storage, "remove_session"):
+        try:
+            storage.remove_session()
+        except Exception:  # pragma: no cover - best-effort sync
+            pass
+    gc.collect()
+
+
+def _commit_and_reload_artifacts(
+    context: str,
+    study: "optuna.study.Study | None" = None,
+) -> None:
+    """Commit pending writes, dispose any open Optuna sqlite handles, then
+    reload the volume. Reload failures are logged and swallowed so a rare
+    open-file edge case never crashes the sweep.
+    """
+    _commit_artifacts_volume_safely(context)
+    _close_optuna_storage(study)
+    try:
+        artifacts_vol.reload()
+    except Exception as exc:  # pragma: no cover - best-effort sync
+        print(f"[sweep] artifacts_vol.reload() skipped ({context}): {exc}")
+
+
+def _hashable_params(params: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """Stable, hashable representation of an Optuna ``trial.params`` dict.
+
+    Used to key salvage hints so we can match a re-enqueued trial back to
+    its original orphaned RUNNING trial. Optuna's ``enqueue_trial(params)``
+    injects exact param values, so float equality is safe here.
+    """
+    return tuple(sorted(params.items(), key=lambda kv: kv[0]))
+
+
+def _salvage_orphaned_running_trials(
+    study: "optuna.study.Study",
+    num_rung_stages: int,
+) -> dict[tuple[tuple[str, Any], ...], dict[str, Any]]:
+    """Recover trials stuck in ``RUNNING`` state from a previous aborted run.
+
+    When the parent sweep container is killed mid-trial (Modal budget
+    cap, host preemption, manual stop, container OOM, ...), any trial
+    that was actively running ends up frozen in ``RUNNING`` inside the
+    Optuna sqlite DB. On the next sweep launch this function:
+
+    1. Finds those orphaned trials.
+    2. Marks them ``FAIL`` so the study state is consistent and Optuna's
+       progress accounting is correct.
+    3. Re-enqueues a fresh trial with the **same hyperparameters** via
+       :py:meth:`optuna.study.Study.enqueue_trial`. The next call to
+       ``study.optimize()`` will sample those enqueued params first.
+    4. Returns a ``{params_key: {resume_output_dir, last_recorded_stage,
+       original_trial_number}}`` mapping. The objective uses this to point
+       ``train_sam3.remote(... resume_output_dir=...)`` at the last
+       committed checkpoint dir, so the salvaged trial resumes training
+       from the last completed epoch instead of restarting from epoch 0.
+
+    Returns an empty dict when there are no orphans.
+    """
+    if num_rung_stages < 1:
+        return {}
+
+    salvage_hints: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    salvaged_count = 0
+    for trial in list(study.trials):
+        if trial.state != optuna.trial.TrialState.RUNNING:
+            continue
+
+        # Find the most recent stage that recorded an output_dir; that's
+        # the dir train_sam3 last wrote checkpoints into for this trial.
+        last_recorded_stage = 0
+        last_output_dir: str | None = None
+        for s in range(num_rung_stages, 0, -1):
+            recorded = trial.user_attrs.get(f"stage_{s}_output_dir")
+            if isinstance(recorded, str) and recorded:
+                last_recorded_stage = s
+                last_output_dir = recorded
+                break
+
+        # Verify the recorded dir actually has a resumable checkpoint
+        # right now. If not, fall back to a clean restart for this trial.
+        if last_output_dir is not None:
+            checkpoint_present = any(
+                (Path(last_output_dir) / name).exists()
+                for name in _RESUMABLE_CHECKPOINT_FILES
+            )
+            if not checkpoint_present:
+                last_output_dir = None
+                last_recorded_stage = 0
+
+        # Mark the orphan as FAIL via storage internals -- Optuna's public
+        # API doesn't expose a "set state on existing trial" call, but
+        # `_storage.set_trial_state_values` is stable and used widely.
+        try:
+            study._storage.set_trial_state_values(
+                trial._trial_id,
+                state=optuna.trial.TrialState.FAIL,
+            )
+        except Exception as exc:
+            print(
+                f"[sweep][salvage] failed to mark trial {trial.number} FAIL: {exc}"
+            )
+
+        # Re-enqueue a fresh trial with the same hyperparameters.
+        # `skip_if_exists=False` is required because the trial we just
+        # marked FAIL has these exact params already in the DB.
+        try:
+            study.enqueue_trial(trial.params, skip_if_exists=False)
+        except Exception as exc:
+            print(
+                f"[sweep][salvage] failed to enqueue salvage trial for "
+                f"orphan {trial.number}: {exc}"
+            )
+            continue
+
+        params_key = _hashable_params(trial.params)
+        salvage_hints[params_key] = {
+            "original_trial_number": trial.number,
+            "last_recorded_stage": last_recorded_stage,
+            "resume_output_dir": last_output_dir,
+        }
+        salvaged_count += 1
+        print(
+            f"[sweep][salvage] orphan trial {trial.number}: marked FAIL, "
+            f"re-enqueued with identical params. Last completed stage: "
+            f"{last_recorded_stage}, resume from: {last_output_dir or '<none>'}"
+        )
+
+    if salvaged_count:
+        print(
+            f"[sweep][salvage] re-enqueued {salvaged_count} orphaned trial(s) "
+            "from a previous aborted run."
+        )
+    else:
+        print("[sweep][salvage] no orphaned RUNNING trials detected.")
+    return salvage_hints
 
 # ASHA: keep the best 1/5 each rung.
 PROMOTION_FRACTION = 0.20
@@ -44,22 +254,43 @@ REDUCTION_FACTOR = int(round(1 / PROMOTION_FRACTION))
 # 500k-image regime: aggressively cheap early rungs, full budget only at the end.
 SAMPLE_SCHEDULE = [1.0, 3.0, 10.0, 30.0, 100.0]
 EPOCH_RATIO_SCHEDULE = [1.0 / 14.0, 2.0 / 14.0, 4.0 / 14.0, 8.0 / 14.0, 1.0]
+# Use smaller validation subsets for early rungs to reduce evaluation cost.
+VALID_SAMPLE_SCHEDULE = [2.0, 5.0, 10.0, 25.0, 100.0]
+# Avoid expensive full-validation every epoch in later stages.
+# Validation still always runs on the final epoch in trainer.
+EVAL_EVERY_N_EPOCHS_SCHEDULE = [1, 1, 2, 3, 4]
+# Disable step-based validation inside an epoch for sweep speed.
+SWEEP_EVAL_STEPS = 10_000_000
 NUM_RUNG_STAGES = len(SAMPLE_SCHEDULE)
 
 
 def _build_stage_schedule(max_epochs: int) -> list[dict]:
     """Create progressively larger sample/epoch budgets by rung."""
-    if len(SAMPLE_SCHEDULE) != len(EPOCH_RATIO_SCHEDULE):
-        raise ValueError("SAMPLE_SCHEDULE and EPOCH_RATIO_SCHEDULE must have same length")
+    if (
+        len(SAMPLE_SCHEDULE) != len(EPOCH_RATIO_SCHEDULE)
+        or len(SAMPLE_SCHEDULE) != len(VALID_SAMPLE_SCHEDULE)
+        or len(SAMPLE_SCHEDULE) != len(EVAL_EVERY_N_EPOCHS_SCHEDULE)
+    ):
+        raise ValueError(
+            "SAMPLE_SCHEDULE, EPOCH_RATIO_SCHEDULE, VALID_SAMPLE_SCHEDULE, and "
+            "EVAL_EVERY_N_EPOCHS_SCHEDULE must have same length"
+        )
 
     stages: list[dict] = []
     prev_epochs = 0
-    for sample_percent, ratio in zip(SAMPLE_SCHEDULE, EPOCH_RATIO_SCHEDULE):
+    for sample_percent, valid_sample_percent, eval_every_n_epochs, ratio in zip(
+        SAMPLE_SCHEDULE,
+        VALID_SAMPLE_SCHEDULE,
+        EVAL_EVERY_N_EPOCHS_SCHEDULE,
+        EPOCH_RATIO_SCHEDULE,
+    ):
         epoch_budget = max(1, int(round(max_epochs * ratio)))
         epoch_budget = max(epoch_budget, prev_epochs + 1)
         stages.append(
             {
                 "sample_percent": sample_percent,
+                "valid_sample_percent": valid_sample_percent,
+                "eval_every_n_epochs": eval_every_n_epochs,
                 "num_epochs": epoch_budget,
             }
         )
@@ -221,8 +452,14 @@ def _build_stage_config(base_config: SAM3LoRAConfig, trial_overrides: dict, stag
         config_dict,
         {
             "training": {
-                "data": {"sample_percent": stage_cfg["sample_percent"]},
+                "data": {
+                    "sample_percent": stage_cfg["sample_percent"],
+                    "valid_sample_percent": stage_cfg["valid_sample_percent"],
+                    "valid_sample_seed": 42,
+                },
                 "num_epochs": stage_cfg["num_epochs"],
+                "eval_steps": SWEEP_EVAL_STEPS,
+                "eval_every_n_epochs": stage_cfg["eval_every_n_epochs"],
             },
             "output": {
                 "output_dir": f"outputs/final_optuna_asha/trial_{trial_number:04d}",
@@ -236,7 +473,10 @@ def _objective_factory(
     base_config: SAM3LoRAConfig,
     objective_mode: str,
     cost_penalty_per_gpu_hour: float,
+    salvage_hints: dict[tuple[tuple[str, Any], ...], dict[str, Any]] | None = None,
 ):
+    salvage_hints = dict(salvage_hints or {})
+
     def objective(trial: optuna.trial.Trial) -> float:
         trial_overrides, max_epochs = _suggest_trial_overrides(trial)
         stage_schedule = _build_stage_schedule(max_epochs=max_epochs)
@@ -244,9 +484,27 @@ def _objective_factory(
         trial_start_time = time.perf_counter()
         cumulative_stage_runtime_hours = 0.0
 
+        # If this trial's params match a salvage hint from a previous run
+        # that was killed mid-flight, point stage 1 at the last committed
+        # checkpoint dir so train_sam3 resumes from the last epoch instead
+        # of starting over.
+        params_key = _hashable_params(trial.params)
+        salvage = salvage_hints.pop(params_key, None)
+        if salvage is not None:
+            trial.set_user_attr("salvage_origin_trial_number", salvage["original_trial_number"])
+            trial.set_user_attr("salvage_last_recorded_stage", salvage["last_recorded_stage"])
+            trial.set_user_attr("salvage_resume_output_dir", salvage["resume_output_dir"])
+            print(
+                f"[sweep][salvage] trial {trial.number} is a salvage of "
+                f"{salvage['original_trial_number']}; resume_dir="
+                f"{salvage['resume_output_dir'] or '<none>'}"
+            )
+
         best_stage_val_loss = float("inf")
         final_stage_val_loss = None
-        resume_output_dir = None
+        resume_output_dir = (
+            salvage["resume_output_dir"] if salvage is not None else None
+        )
         for stage_idx, stage_cfg in enumerate(stage_schedule, start=1):
             stage_config = _build_stage_config(
                 base_config=base_config,
@@ -257,9 +515,12 @@ def _objective_factory(
             )
 
             stage_start_time = time.perf_counter()
+            # `fresh_run` only applies on stage 1, AND only when we don't
+            # have a salvage checkpoint to resume from. With a resume hint
+            # we want train_sam3 to attach to the existing run dir.
             run_result = train_sam3.remote(
                 stage_config,
-                fresh_run=(stage_idx == 1),
+                fresh_run=(stage_idx == 1) and (resume_output_dir is None),
                 resume_output_dir=resume_output_dir,
             )
             stage_runtime_hours = (time.perf_counter() - stage_start_time) / 3600.0
@@ -271,6 +532,14 @@ def _objective_factory(
 
             trial.set_user_attr(f"stage_{stage_idx}_output_dir", run_result["output_dir"])
             trial.set_user_attr(f"stage_{stage_idx}_sample_percent", stage_cfg["sample_percent"])
+            trial.set_user_attr(
+                f"stage_{stage_idx}_valid_sample_percent",
+                stage_cfg["valid_sample_percent"],
+            )
+            trial.set_user_attr(
+                f"stage_{stage_idx}_eval_every_n_epochs",
+                stage_cfg["eval_every_n_epochs"],
+            )
             trial.set_user_attr(f"stage_{stage_idx}_num_epochs", stage_cfg["num_epochs"])
             trial.set_user_attr(f"stage_{stage_idx}_val_loss", stage_val_loss)
             trial.set_user_attr(f"stage_{stage_idx}_runtime_hours", stage_runtime_hours)
@@ -290,6 +559,15 @@ def _objective_factory(
                 stage_score = stage_val_loss + cost_penalty_per_gpu_hour * cumulative_stage_runtime_hours
             trial.set_user_attr(f"stage_{stage_idx}_objective_score", stage_score)
             trial.report(stage_score, step=stage_idx)
+
+            # Flush this trial's user_attrs + intermediate value to the
+            # shared volume so a live "describe current leader" / benchmark
+            # caller can see this stage's result immediately, even though
+            # the sweep may still be running for days.
+            _commit_artifacts_volume_safely(
+                f"trial={trial.number}, end of stage {stage_idx}"
+            )
+
             if trial.should_prune():
                 raise optuna.TrialPruned(
                     f"Pruned at stage {stage_idx}: val_loss={stage_val_loss:.6f}, "
@@ -329,7 +607,10 @@ def _print_study_results(
 
     completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if completed_trials:
-        sorted_by_score = sorted(completed_trials, key=lambda t: float(t.value))
+        sorted_by_score = sorted(
+            completed_trials,
+            key=lambda t: float(t.value) if t.value is not None else float("inf"),
+        )
         top_k = max(1, int(round(len(sorted_by_score) * max(0.01, min(rerank_top_fraction, 1.0)))))
         rerank_pool = sorted_by_score[:top_k]
 
@@ -357,8 +638,16 @@ def _print_study_results(
             rerank_rows.append(
                 {
                     "trial_number": trial.number,
-                    "objective_score": float(trial.value),
-                    "val_loss": float(trial.user_attrs.get("final_stage_val_loss", trial.value)),
+                    "objective_score": (
+                        float(trial.value) if trial.value is not None else float("inf")
+                    ),
+                    "val_loss": (
+                        float(trial.user_attrs["final_stage_val_loss"])
+                        if isinstance(trial.user_attrs.get("final_stage_val_loss"), (int, float))
+                        else (
+                            float(trial.value) if trial.value is not None else float("inf")
+                        )
+                    ),
                     "trial_runtime_hours": trial.user_attrs.get("trial_runtime_hours"),
                     "output_dir": stage_output_dir,
                     "iou": metrics.get("iou"),
@@ -419,15 +708,20 @@ def run_optuna_study(
     pruner_type: str = "hyperband",
     objective_mode: str = "cost_aware",
     cost_penalty_per_gpu_hour: float = 0.03,
+    base_config_dict: dict[str, object] | None = None,
+    salvage_orphaned_trials: bool = True,
 ):
     """Run final-stage Optuna sweep (SHA/Hyperband) using shared SQLite on artifacts volume."""
-    config_path = (
-        Path(__file__).resolve().parent
-        / "sam3_table"
-        / "testSamples"
-        / "full_lora_config.yaml"
-    )
-    base_config = SAM3LoRAConfig.from_yaml(config_path)
+    if base_config_dict is not None:
+        base_config = SAM3LoRAConfig.model_validate(base_config_dict)
+    else:
+        config_path = (
+            Path(__file__).resolve().parent
+            / "sam3_table"
+            / "testSamples"
+            / "full_lora_config.yaml"
+        )
+        base_config = SAM3LoRAConfig.from_yaml(config_path)
     parallel_workers = max(1, int(parallel_workers))
     sqlite_lock_timeout_sec = max(1, int(sqlite_lock_timeout_sec))
     cost_penalty_per_gpu_hour = max(0.0, float(cost_penalty_per_gpu_hour))
@@ -484,11 +778,46 @@ def run_optuna_study(
     print(f"Total requested trials: {n_trials}")
     print(f"Parallel Optuna workers: {parallel_workers}")
 
+    # Recover any trials stuck in RUNNING state from a previously aborted
+    # sweep (Modal budget cap, host preemption, manual stop, ...). The
+    # returned hints tell the objective to point train_sam3 at the last
+    # committed checkpoint dir so the salvaged trial picks up from the last
+    # epoch rather than restarting from scratch.
+    salvage_hints: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    if salvage_orphaned_trials:
+        salvage_hints = _salvage_orphaned_running_trials(
+            study, num_rung_stages=NUM_RUNG_STAGES
+        )
+        # Persist the salvage decisions before launching new training so a
+        # second crash mid-salvage doesn't lose them.
+        _commit_artifacts_volume_safely("post-salvage state")
+    else:
+        print("[sweep][salvage] disabled by --no-salvage-orphaned-trials")
+
     objective = _objective_factory(
         base_config,
         objective_mode=normalized_objective_mode,
         cost_penalty_per_gpu_hour=cost_penalty_per_gpu_hour,
+        salvage_hints=salvage_hints,
     )
+
+    def _commit_after_trial(
+        _study: optuna.study.Study,
+        trial: optuna.trial.FrozenTrial,
+    ) -> None:
+        """Optuna callback that flushes the artifacts volume after each
+        trial finishes (COMPLETE / PRUNED / FAIL).
+
+        This is what enables the "extract top-performing model and
+        benchmark it at any time" workflow: a live monitor running e.g.
+        ``modal run eval_tablebank.py --use-current-leader`` against the
+        same ``artifacts-vol`` will see the most recently finalized trial
+        as soon as this callback returns.
+        """
+        _commit_artifacts_volume_safely(
+            f"trial={trial.number} state={trial.state.name}"
+        )
+
     study.optimize(
         objective,
         n_trials=n_trials,
@@ -496,7 +825,16 @@ def run_optuna_study(
         gc_after_trial=True,
         show_progress_bar=True,
         n_jobs=max(1, parallel_workers),
+        callbacks=[_commit_after_trial],
     )
+
+    # Final sync at the end of the sweep: commit so any downstream reader
+    # (deployed `describe_current_leader`, ad-hoc scripts, etc.) sees the
+    # finalized state of the study, dispose the Optuna sqlite handle so
+    # the volume reload below doesn't trip over open files, then reload so
+    # any in-process logic that inspects the filesystem after this point
+    # can see checkpoints committed from parallel training containers.
+    _commit_and_reload_artifacts("end of run_optuna_study", study=study)
 
     _print_study_results(
         study,
@@ -508,7 +846,7 @@ def run_optuna_study(
 @app.local_entrypoint()
 def main(
     n_trials: int = 120,
-    timeout_hours: float = 96,
+    timeout_hours: float = 120,
     study_name: str = "sam3-final-optuna-asha",
     rerank_top_fraction: float = 0.25,
     parallel_workers: int = 10,
@@ -516,7 +854,25 @@ def main(
     pruner_type: str = "hyperband",
     objective_mode: str = "cost_aware",
     cost_penalty_per_gpu_hour: float = 0.02,
+    auto_deploy_tablebank_eval: bool = True,
+    salvage_orphaned_trials: bool = True,
 ):
+    config_path = (
+        Path(__file__).resolve().parent
+        / "sam3_table"
+        / "testSamples"
+        / "full_lora_config.yaml"
+    )
+    base_config = SAM3LoRAConfig.from_yaml(config_path)
+
+    # Auto-deploy the `tablebank-eval` Modal app so any downstream leader
+    # extraction / evaluation step can resolve it via `Function.from_name`
+    # without requiring users to manually run `modal deploy eval_tablebank.py`.
+    if auto_deploy_tablebank_eval:
+        from eval_tablebank import ensure_deployed as _ensure_tablebank_eval_deployed
+
+        _ensure_tablebank_eval_deployed()
+
     run_optuna_study.remote(
         n_trials=n_trials,
         timeout_hours=timeout_hours,
@@ -527,4 +883,6 @@ def main(
         pruner_type=pruner_type,
         objective_mode=objective_mode,
         cost_penalty_per_gpu_hour=cost_penalty_per_gpu_hour,
+        base_config_dict=base_config.model_dump(mode="json"),
+        salvage_orphaned_trials=salvage_orphaned_trials,
     )
