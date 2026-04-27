@@ -335,7 +335,13 @@ def _build_stage_schedule(max_epochs: int) -> list[dict]:
 def _suggest_trial_overrides(trial: optuna.trial.Trial) -> tuple[dict, int]:
     """Suggest a rich final-run hyperparameter set."""
     lora_rank = trial.suggest_categorical("lora_rank", [8, 16, 24, 32, 48, 64])
-    lora_alpha = trial.suggest_categorical("lora_alpha", [lora_rank, lora_rank * 2, lora_rank * 4])
+    # Suggest the *multiplier* (alpha / rank), not alpha itself, so the
+    # categorical distribution stays constant across trials. Suggesting
+    # `lora_alpha` directly with rank-dependent choices triggers Optuna's
+    # `CategoricalDistribution does not support dynamic value space.`
+    # error -- the choice set has to match the first trial's choices.
+    lora_alpha_multiplier = trial.suggest_categorical("lora_alpha_multiplier", [1, 2, 4])
+    lora_alpha = lora_rank * lora_alpha_multiplier
 
     max_epochs = 14
 
@@ -385,24 +391,52 @@ def _suggest_trial_overrides(trial: optuna.trial.Trial) -> tuple[dict, int]:
     timeout=60 * 10,
 )
 def read_latest_val_loss(output_dir: str) -> float:
-    """Read the latest val loss written by trainer to val_stats.json."""
+    """Read the latest val loss written by trainer to val_stats.json.
+
+    Falls back to ``best_val_loss`` stored inside checkpoint files when
+    ``val_stats.json`` is missing (e.g. when the run finished an epoch but the
+    epoch-level eval was skipped due to ``eval_every_n_epochs`` and the final
+    epoch eval did not flush before the volume was reloaded).
+    """
+    import torch
+
+    artifacts_vol.reload()
     stats_path = Path(output_dir) / "val_stats.json"
-    if not stats_path.exists():
-        raise FileNotFoundError(f"Missing validation stats file: {stats_path}")
-
     last_val_loss = None
-    for raw_line in stats_path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line:
+    if stats_path.exists():
+        for raw_line in stats_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if "val_loss" in record:
+                last_val_loss = float(record["val_loss"])
+        if last_val_loss is not None:
+            return last_val_loss
+
+    ckpt_candidates = [
+        Path(output_dir) / "checkpoint_best.pt",
+        Path(output_dir) / "checkpoint_epoch.pt",
+    ]
+    for ckpt_path in ckpt_candidates:
+        if not ckpt_path.exists():
             continue
-        record = json.loads(line)
-        if "val_loss" in record:
-            last_val_loss = float(record["val_loss"])
+        try:
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+        except Exception as exc:
+            print(f"[read_latest_val_loss] Failed to load {ckpt_path}: {exc}")
+            continue
+        best_val_loss = checkpoint.get("best_val_loss") if isinstance(checkpoint, dict) else None
+        if isinstance(best_val_loss, (int, float)):
+            print(
+                f"[read_latest_val_loss] Falling back to checkpoint best_val_loss "
+                f"({best_val_loss}) from {ckpt_path}"
+            )
+            return float(best_val_loss)
 
-    if last_val_loss is None:
-        raise ValueError(f"No val_loss entries found in {stats_path}")
-
-    return last_val_loss
+    raise FileNotFoundError(
+        f"Missing validation stats and checkpoint val loss under: {output_dir}"
+    )
 
 
 @app.function(
