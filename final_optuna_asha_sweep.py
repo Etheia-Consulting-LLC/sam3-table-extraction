@@ -843,6 +843,172 @@ def run_optuna_study(
     )
 
 
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=60 * 10,
+)
+def describe_leader_from_study(
+    study_name: str = "sam3-final-optuna-asha",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    num_rung_stages: int = NUM_RUNG_STAGES,
+    require_weights_on_disk: bool = True,
+) -> dict[str, Any]:
+    """Self-contained leader extraction.
+
+    Reads ``/artifacts/optuna/<study_name>.db`` directly and returns the
+    best trial's weights path + hyperparameters. **Does not** depend on
+    the ``tablebank-eval`` app being deployed -- this is the "give me the
+    leader without running anything through eval_tablebank" path.
+
+    Selection rules (for ``direction="minimize"``):
+      * Always considers ``COMPLETE`` trials.
+      * Optionally considers ``PRUNED`` trials (their last reported
+        intermediate value is used as the score).
+      * Optionally considers ``RUNNING`` trials (same; useful while a
+        sweep is in progress).
+      * Picks the trial with the lowest score whose stage output
+        directory contains a ``best_lora_weights.pt`` (or
+        ``last_lora_weights.pt``) file -- unless
+        ``require_weights_on_disk=False``, in which case it advertises
+        the conventional path even if not yet visible.
+
+    Returns a JSON-shaped dict with the leader info plus enough metadata
+    to drive a downstream evaluation or model-loading step.
+    """
+    artifacts_vol.reload()
+    sqlite_lock_timeout_sec = max(1, int(sqlite_lock_timeout_sec))
+    num_rung_stages = max(1, int(num_rung_stages))
+
+    sqlite_path = Path(MODAL_ARTIFACTS_DIR) / "optuna" / f"{study_name}.db"
+    if not sqlite_path.exists():
+        raise FileNotFoundError(
+            f"Optuna study DB not found at {sqlite_path}. "
+            "Make sure a sweep with this study_name has started and committed."
+        )
+
+    with sqlite3.connect(str(sqlite_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.commit()
+
+    storage_url = f"sqlite:///{sqlite_path.as_posix()}?timeout={sqlite_lock_timeout_sec}"
+    study = optuna.load_study(study_name=study_name, storage=storage_url)
+
+    candidates: list[dict[str, Any]] = []
+    state_counts: dict[str, int] = {}
+    for trial in study.trials:
+        state_counts[trial.state.name] = state_counts.get(trial.state.name, 0) + 1
+
+        score: float | None = None
+        if (
+            trial.state == optuna.trial.TrialState.COMPLETE
+            and trial.value is not None
+        ):
+            score = float(trial.value)
+        elif (
+            include_pruned_trials
+            and trial.state == optuna.trial.TrialState.PRUNED
+            and trial.intermediate_values
+        ):
+            latest_step = max(trial.intermediate_values.keys())
+            score = float(trial.intermediate_values[latest_step])
+        elif (
+            include_running_trials
+            and trial.state == optuna.trial.TrialState.RUNNING
+            and trial.intermediate_values
+        ):
+            latest_step = max(trial.intermediate_values.keys())
+            score = float(trial.intermediate_values[latest_step])
+
+        if score is None:
+            continue
+
+        # Resolve the stage output dir for this trial.
+        stage_output_dir = trial.user_attrs.get(f"stage_{num_rung_stages}_output_dir")
+        if not isinstance(stage_output_dir, str):
+            stage_keys = sorted(
+                k
+                for k in trial.user_attrs.keys()
+                if k.startswith("stage_") and k.endswith("_output_dir")
+            )
+            if stage_keys:
+                stage_output_dir = trial.user_attrs[stage_keys[-1]]
+        if not isinstance(stage_output_dir, str):
+            continue
+
+        weights_candidates = [
+            Path(stage_output_dir) / "best_lora_weights.pt",
+            Path(stage_output_dir) / "last_lora_weights.pt",
+        ]
+        visible_weights = next(
+            (p for p in weights_candidates if p.exists()), None
+        )
+        if visible_weights is None and require_weights_on_disk:
+            continue
+        weights_path_str = (
+            str(visible_weights)
+            if visible_weights is not None
+            else str(weights_candidates[0])
+        )
+
+        candidates.append(
+            {
+                "trial_number": trial.number,
+                "state": trial.state.name,
+                "score": score,
+                "output_dir": stage_output_dir,
+                "weights_path": weights_path_str,
+                "weights_visible_on_disk": visible_weights is not None,
+                "objective_mode": trial.user_attrs.get("objective_mode"),
+                "final_stage_val_loss": trial.user_attrs.get("final_stage_val_loss"),
+                "trial_runtime_hours": trial.user_attrs.get("trial_runtime_hours"),
+                "salvage_origin_trial_number": trial.user_attrs.get(
+                    "salvage_origin_trial_number"
+                ),
+                "hyperparameters": dict(trial.params),
+            }
+        )
+
+    if not candidates:
+        return {
+            "study_name": study_name,
+            "sqlite_path": str(sqlite_path),
+            "total_trials": len(study.trials),
+            "trial_state_counts": state_counts,
+            "leader_trial_number": None,
+            "leader_state": None,
+            "leader_score": None,
+            "weights_path": None,
+            "output_dir": None,
+            "hyperparameters": {},
+            "reason": (
+                "No trial with a usable score and weights path was found. "
+                "Wait for at least one stage to finish, or relax the filters "
+                "via include_running_trials / require_weights_on_disk."
+            ),
+        }
+
+    best = min(candidates, key=lambda c: c["score"])
+    return {
+        "study_name": study_name,
+        "sqlite_path": str(sqlite_path),
+        "total_trials": len(study.trials),
+        "trial_state_counts": state_counts,
+        "leader_trial_number": best["trial_number"],
+        "leader_state": best["state"],
+        "leader_score": best["score"],
+        "weights_path": best["weights_path"],
+        "weights_visible_on_disk": best["weights_visible_on_disk"],
+        "output_dir": best["output_dir"],
+        "objective_mode": best["objective_mode"],
+        "final_stage_val_loss": best["final_stage_val_loss"],
+        "trial_runtime_hours": best["trial_runtime_hours"],
+        "salvage_origin_trial_number": best["salvage_origin_trial_number"],
+        "hyperparameters": best["hyperparameters"],
+    }
+
+
 @app.local_entrypoint()
 def main(
     n_trials: int = 120,
@@ -886,3 +1052,110 @@ def main(
         base_config_dict=base_config.model_dump(mode="json"),
         salvage_orphaned_trials=salvage_orphaned_trials,
     )
+
+
+@app.local_entrypoint()
+def show_current_leader(
+    study_name: str = "sam3-final-optuna-asha",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    require_weights_on_disk: bool = True,
+):
+    """Print the current best trial in this study as JSON.
+
+    Self-contained -- reads the Optuna sqlite DB on ``artifacts-vol``
+    directly and does not require ``tablebank-eval`` to be deployed.
+
+    Examples:
+        modal run final_optuna_asha_sweep.py::show_current_leader
+        modal run final_optuna_asha_sweep.py::show_current_leader \\
+            --study-name sam3-final-optuna-asha-v2
+        modal run final_optuna_asha_sweep.py::show_current_leader \\
+            --include-running-trials
+    """
+    result = describe_leader_from_study.remote(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        include_pruned_trials=include_pruned_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        num_rung_stages=NUM_RUNG_STAGES,
+        require_weights_on_disk=require_weights_on_disk,
+    )
+    print(json.dumps(result, indent=2, default=str))
+
+
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=60 * 10,
+)
+def _read_leader_weights_bytes(
+    study_name: str = "sam3-final-optuna-asha",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+) -> dict[str, Any]:
+    """Resolve the current leader and return its weights file as bytes
+    plus minimal metadata. Used by :func:`download_leader_weights`.
+    """
+    leader = describe_leader_from_study.local(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        include_pruned_trials=include_pruned_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        num_rung_stages=NUM_RUNG_STAGES,
+        require_weights_on_disk=True,
+    )
+    weights_path = leader.get("weights_path")
+    if not isinstance(weights_path, str) or not Path(weights_path).exists():
+        raise FileNotFoundError(
+            f"No leader weights file found for study '{study_name}'. "
+            f"Got leader info: {leader}"
+        )
+    data = Path(weights_path).read_bytes()
+    return {
+        "leader_trial_number": leader["leader_trial_number"],
+        "leader_score": leader["leader_score"],
+        "remote_weights_path": weights_path,
+        "weights_bytes": data,
+        "hyperparameters": leader["hyperparameters"],
+    }
+
+
+@app.local_entrypoint()
+def download_leader_weights(
+    study_name: str = "sam3-final-optuna-asha",
+    output_path: str = "leader_weights.pt",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+):
+    """Download the current leader's LoRA weights file to a local path.
+
+    Self-contained -- does not require ``tablebank-eval`` to be deployed.
+
+    Examples:
+        modal run final_optuna_asha_sweep.py::download_leader_weights
+        modal run final_optuna_asha_sweep.py::download_leader_weights \\
+            --study-name sam3-final-optuna-asha-v2 \\
+            --output-path ./best_lora_weights.pt
+    """
+    payload = _read_leader_weights_bytes.remote(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        include_pruned_trials=include_pruned_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+    )
+    local_target = Path(output_path).resolve()
+    local_target.parent.mkdir(parents=True, exist_ok=True)
+    local_target.write_bytes(payload["weights_bytes"])
+    summary = {
+        "study_name": study_name,
+        "leader_trial_number": payload["leader_trial_number"],
+        "leader_score": payload["leader_score"],
+        "remote_weights_path": payload["remote_weights_path"],
+        "local_weights_path": str(local_target),
+        "bytes_written": len(payload["weights_bytes"]),
+        "hyperparameters": payload["hyperparameters"],
+    }
+    print(json.dumps(summary, indent=2, default=str))
