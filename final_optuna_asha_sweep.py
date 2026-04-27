@@ -23,6 +23,7 @@ import copy
 import json
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -262,6 +263,39 @@ EVAL_EVERY_N_EPOCHS_SCHEDULE = [1, 1, 2, 3, 4]
 # Disable step-based validation inside an epoch for sweep speed.
 SWEEP_EVAL_STEPS = 10_000_000
 NUM_RUNG_STAGES = len(SAMPLE_SCHEDULE)
+
+# Modal caps a single function invocation at 24h. We give ourselves a 30-min
+# buffer below that for clean shutdown (final commits, dispose engine, spawn
+# successor) so the chain can hand off without anything getting truncated.
+_PER_CONTAINER_MAX_HOURS = 23.5
+
+# Trial states that have "consumed" their budget. Used by the self-respawn
+# logic to decide how many trials are still owed against the chain-wide
+# `n_trials` total. RUNNING/WAITING are intentionally excluded -- RUNNING
+# trials get re-classified by `_salvage_orphaned_running_trials` at startup,
+# and WAITING ones are queued (re-enqueued salvage trials) and will execute.
+_FINISHED_TRIAL_STATES = frozenset(
+    {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+        optuna.trial.TrialState.FAIL,
+    }
+)
+
+
+def _count_finished_trials(study: "optuna.study.Study") -> int:
+    return sum(1 for t in study.trials if t.state in _FINISHED_TRIAL_STATES)
+
+
+def _chain_started_at(study: "optuna.study.Study") -> datetime:
+    """Earliest trial start across the whole study, or "now" if empty.
+
+    Used so a self-respawning chain of containers can compute total
+    wall-clock elapsed without needing to plumb a start-timestamp through
+    every spawn call -- the source of truth lives in the Optuna DB.
+    """
+    starts = [t.datetime_start for t in study.trials if t.datetime_start is not None]
+    return min(starts) if starts else datetime.now()
 
 
 def _build_stage_schedule(max_epochs: int) -> list[dict]:
@@ -696,11 +730,11 @@ def _print_study_results(
 
 @app.function(
     volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
-    timeout=60 * 60 * 24 * 14,
+    timeout=60 * 60 * 24,
 )
 def run_optuna_study(
     n_trials: int = 120,
-    timeout_hours: float = 96,
+    timeout_hours: float = 120,
     study_name: str = "sam3-final-optuna-asha",
     rerank_top_fraction: float = 0.25,
     parallel_workers: int = 10,
@@ -711,7 +745,18 @@ def run_optuna_study(
     base_config_dict: dict[str, object] | None = None,
     salvage_orphaned_trials: bool = True,
 ):
-    """Run final-stage Optuna sweep (SHA/Hyperband) using shared SQLite on artifacts volume."""
+    """Run final-stage Optuna sweep (SHA/Hyperband) using shared SQLite on artifacts volume.
+
+    ``n_trials`` and ``timeout_hours`` are interpreted as **chain-wide
+    budgets**, not per-container limits. Modal caps a single function
+    invocation at 24h, so when the budget exceeds that this function
+    spawns a successor (``run_optuna_study.spawn(...)``) just before
+    exiting. Each successor reattaches to the shared SQLite study via
+    ``load_if_exists=True`` and uses the salvage path to recover the
+    orphaned RUNNING trial from its predecessor. Total work across the
+    chain converges to ``n_trials`` finished trials or ``timeout_hours``
+    of wall-clock, whichever comes first.
+    """
     if base_config_dict is not None:
         base_config = SAM3LoRAConfig.model_validate(base_config_dict)
     else:
@@ -818,28 +863,102 @@ def run_optuna_study(
             f"trial={trial.number} state={trial.state.name}"
         )
 
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        timeout=int(timeout_hours * 3600),
-        gc_after_trial=True,
-        show_progress_bar=True,
-        n_jobs=max(1, parallel_workers),
-        callbacks=[_commit_after_trial],
+    # Compute chain-wide budget remaining. The successor of a 24h-killed
+    # container reads these numbers off the shared Optuna DB rather than
+    # via plumbed args, so a chain can be re-launched manually if needed
+    # and still pick up the right "trials/hours left" automatically.
+    chain_started_at = _chain_started_at(study)
+    elapsed_chain_hours = (datetime.now() - chain_started_at).total_seconds() / 3600.0
+    finished_at_start = _count_finished_trials(study)
+    remaining_trials = max(0, n_trials - finished_at_start)
+    remaining_chain_hours = max(0.0, timeout_hours - elapsed_chain_hours)
+    per_container_hours = min(remaining_chain_hours, _PER_CONTAINER_MAX_HOURS)
+
+    print(
+        f"[sweep][chain] finished_trials={finished_at_start}/{n_trials}, "
+        f"elapsed={elapsed_chain_hours:.2f}h/{timeout_hours:.2f}h, "
+        f"per_container_budget={per_container_hours:.2f}h"
     )
 
-    # Final sync at the end of the sweep: commit so any downstream reader
-    # (deployed `describe_current_leader`, ad-hoc scripts, etc.) sees the
-    # finalized state of the study, dispose the Optuna sqlite handle so
-    # the volume reload below doesn't trip over open files, then reload so
-    # any in-process logic that inspects the filesystem after this point
-    # can see checkpoints committed from parallel training containers.
+    if remaining_trials <= 0 or per_container_hours <= 0:
+        print(
+            "[sweep][chain] chain budget already exhausted before optimize; "
+            "skipping study.optimize and not spawning a successor."
+        )
+    else:
+        study.optimize(
+            objective,
+            n_trials=remaining_trials,
+            timeout=int(per_container_hours * 3600),
+            gc_after_trial=True,
+            show_progress_bar=True,
+            n_jobs=max(1, parallel_workers),
+            callbacks=[_commit_after_trial],
+        )
+
+    # Final sync at the end of this container's slice: commit so any
+    # downstream reader (deployed `describe_current_leader`, ad-hoc
+    # scripts, the spawned successor) sees the finalized state of the
+    # study, dispose the Optuna sqlite handle so the volume reload below
+    # doesn't trip over open files, then reload so any in-process logic
+    # that inspects the filesystem after this point can see checkpoints
+    # committed from parallel training containers.
     _commit_and_reload_artifacts("end of run_optuna_study", study=study)
 
-    _print_study_results(
-        study,
+    finished_after = _count_finished_trials(study)
+    new_finished = finished_after - finished_at_start
+    elapsed_after_hours = (datetime.now() - chain_started_at).total_seconds() / 3600.0
+
+    # Decide whether to hand off to a fresh 24h container. Three stop
+    # conditions, any one of which terminates the chain:
+    #   1. Target trial count reached.
+    #   2. Total wall-clock budget exhausted (with a 30-min buffer so the
+    #      successor doesn't spin up only to immediately bail).
+    #   3. Safety stop: this container made zero progress. Without this
+    #      guard, a misconfigured run that fails on every trial would
+    #      respawn forever and burn the GPU budget on nothing.
+    target_reached = finished_after >= n_trials
+    timeout_reached = elapsed_after_hours + 0.5 >= timeout_hours
+    no_progress = new_finished == 0 and remaining_trials > 0 and per_container_hours > 0
+
+    if target_reached or timeout_reached or no_progress:
+        reasons: list[str] = []
+        if target_reached:
+            reasons.append(f"target trials reached ({finished_after}/{n_trials})")
+        if timeout_reached:
+            reasons.append(
+                f"chain timeout reached ({elapsed_after_hours:.2f}h/{timeout_hours:.2f}h)"
+            )
+        if no_progress:
+            reasons.append(
+                "container made zero progress on a non-empty budget (safety stop)"
+            )
+        print(f"[sweep][chain] not spawning successor: {'; '.join(reasons)}")
+
+        _print_study_results(
+            study,
+            rerank_top_fraction=rerank_top_fraction,
+            objective_mode=normalized_objective_mode,
+        )
+        return
+
+    print(
+        f"[sweep][chain] spawning successor: new_finished={new_finished}, "
+        f"finished_total={finished_after}/{n_trials}, "
+        f"elapsed={elapsed_after_hours:.2f}h/{timeout_hours:.2f}h"
+    )
+    run_optuna_study.spawn(  # type: ignore[attr-defined]
+        n_trials=n_trials,
+        timeout_hours=timeout_hours,
+        study_name=study_name,
         rerank_top_fraction=rerank_top_fraction,
-        objective_mode=normalized_objective_mode,
+        parallel_workers=parallel_workers,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        pruner_type=pruner_type,
+        objective_mode=objective_mode,
+        cost_penalty_per_gpu_hour=cost_penalty_per_gpu_hour,
+        base_config_dict=base_config_dict,
+        salvage_orphaned_trials=salvage_orphaned_trials,
     )
 
 
@@ -1023,6 +1142,24 @@ def main(
     auto_deploy_tablebank_eval: bool = True,
     salvage_orphaned_trials: bool = True,
 ):
+    """Kick off the chained Optuna sweep.
+
+    ``n_trials`` and ``timeout_hours`` are **chain-wide** budgets. Modal
+    caps any single function call at 24h, so for budgets longer than
+    that, ``run_optuna_study`` self-respawns via ``Function.spawn`` and
+    each successor reattaches to the shared SQLite study. The chain ends
+    when the trial target is hit, the wall-clock budget is hit, or a
+    container makes zero progress (safety stop).
+
+    Recommended usage for budgets that exceed 24h: launch with ``--detach``
+    so the local process can disconnect once the first container is up::
+
+        modal run --detach final_optuna_asha_sweep.py \\
+            --n-trials 120 --timeout-hours 120
+
+    After ``--detach`` returns, your laptop is no longer in the critical
+    path; the chain runs entirely on Modal until budget exhaustion.
+    """
     config_path = (
         Path(__file__).resolve().parent
         / "sam3_table"
