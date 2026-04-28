@@ -23,6 +23,7 @@ import copy
 import json
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -263,6 +264,39 @@ EVAL_EVERY_N_EPOCHS_SCHEDULE = [1, 1, 2, 3, 4]
 SWEEP_EVAL_STEPS = 10_000_000
 NUM_RUNG_STAGES = len(SAMPLE_SCHEDULE)
 
+# Modal caps a single function invocation at 24h. We give ourselves a 30-min
+# buffer below that for clean shutdown (final commits, dispose engine, spawn
+# successor) so the chain can hand off without anything getting truncated.
+_PER_CONTAINER_MAX_HOURS = 23.5
+
+# Trial states that have "consumed" their budget. Used by the self-respawn
+# logic to decide how many trials are still owed against the chain-wide
+# `n_trials` total. RUNNING/WAITING are intentionally excluded -- RUNNING
+# trials get re-classified by `_salvage_orphaned_running_trials` at startup,
+# and WAITING ones are queued (re-enqueued salvage trials) and will execute.
+_FINISHED_TRIAL_STATES = frozenset(
+    {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+        optuna.trial.TrialState.FAIL,
+    }
+)
+
+
+def _count_finished_trials(study: "optuna.study.Study") -> int:
+    return sum(1 for t in study.trials if t.state in _FINISHED_TRIAL_STATES)
+
+
+def _chain_started_at(study: "optuna.study.Study") -> datetime:
+    """Earliest trial start across the whole study, or "now" if empty.
+
+    Used so a self-respawning chain of containers can compute total
+    wall-clock elapsed without needing to plumb a start-timestamp through
+    every spawn call -- the source of truth lives in the Optuna DB.
+    """
+    starts = [t.datetime_start for t in study.trials if t.datetime_start is not None]
+    return min(starts) if starts else datetime.now()
+
 
 def _build_stage_schedule(max_epochs: int) -> list[dict]:
     """Create progressively larger sample/epoch budgets by rung."""
@@ -301,7 +335,13 @@ def _build_stage_schedule(max_epochs: int) -> list[dict]:
 def _suggest_trial_overrides(trial: optuna.trial.Trial) -> tuple[dict, int]:
     """Suggest a rich final-run hyperparameter set."""
     lora_rank = trial.suggest_categorical("lora_rank", [8, 16, 24, 32, 48, 64])
-    lora_alpha = trial.suggest_categorical("lora_alpha", [lora_rank, lora_rank * 2, lora_rank * 4])
+    # Suggest the *multiplier* (alpha / rank), not alpha itself, so the
+    # categorical distribution stays constant across trials. Suggesting
+    # `lora_alpha` directly with rank-dependent choices triggers Optuna's
+    # `CategoricalDistribution does not support dynamic value space.`
+    # error -- the choice set has to match the first trial's choices.
+    lora_alpha_multiplier = trial.suggest_categorical("lora_alpha_multiplier", [1, 2, 4])
+    lora_alpha = lora_rank * lora_alpha_multiplier
 
     max_epochs = 14
 
@@ -351,24 +391,52 @@ def _suggest_trial_overrides(trial: optuna.trial.Trial) -> tuple[dict, int]:
     timeout=60 * 10,
 )
 def read_latest_val_loss(output_dir: str) -> float:
-    """Read the latest val loss written by trainer to val_stats.json."""
+    """Read the latest val loss written by trainer to val_stats.json.
+
+    Falls back to ``best_val_loss`` stored inside checkpoint files when
+    ``val_stats.json`` is missing (e.g. when the run finished an epoch but the
+    epoch-level eval was skipped due to ``eval_every_n_epochs`` and the final
+    epoch eval did not flush before the volume was reloaded).
+    """
+    import torch
+
+    artifacts_vol.reload()
     stats_path = Path(output_dir) / "val_stats.json"
-    if not stats_path.exists():
-        raise FileNotFoundError(f"Missing validation stats file: {stats_path}")
-
     last_val_loss = None
-    for raw_line in stats_path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line:
+    if stats_path.exists():
+        for raw_line in stats_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if "val_loss" in record:
+                last_val_loss = float(record["val_loss"])
+        if last_val_loss is not None:
+            return last_val_loss
+
+    ckpt_candidates = [
+        Path(output_dir) / "checkpoint_best.pt",
+        Path(output_dir) / "checkpoint_epoch.pt",
+    ]
+    for ckpt_path in ckpt_candidates:
+        if not ckpt_path.exists():
             continue
-        record = json.loads(line)
-        if "val_loss" in record:
-            last_val_loss = float(record["val_loss"])
+        try:
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+        except Exception as exc:
+            print(f"[read_latest_val_loss] Failed to load {ckpt_path}: {exc}")
+            continue
+        best_val_loss = checkpoint.get("best_val_loss") if isinstance(checkpoint, dict) else None
+        if isinstance(best_val_loss, (int, float)):
+            print(
+                f"[read_latest_val_loss] Falling back to checkpoint best_val_loss "
+                f"({best_val_loss}) from {ckpt_path}"
+            )
+            return float(best_val_loss)
 
-    if last_val_loss is None:
-        raise ValueError(f"No val_loss entries found in {stats_path}")
-
-    return last_val_loss
+    raise FileNotFoundError(
+        f"Missing validation stats and checkpoint val loss under: {output_dir}"
+    )
 
 
 @app.function(
@@ -696,11 +764,11 @@ def _print_study_results(
 
 @app.function(
     volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
-    timeout=60 * 60 * 24 * 14,
+    timeout=60 * 60 * 24,
 )
 def run_optuna_study(
     n_trials: int = 120,
-    timeout_hours: float = 96,
+    timeout_hours: float = 120,
     study_name: str = "sam3-final-optuna-asha",
     rerank_top_fraction: float = 0.25,
     parallel_workers: int = 10,
@@ -711,7 +779,18 @@ def run_optuna_study(
     base_config_dict: dict[str, object] | None = None,
     salvage_orphaned_trials: bool = True,
 ):
-    """Run final-stage Optuna sweep (SHA/Hyperband) using shared SQLite on artifacts volume."""
+    """Run final-stage Optuna sweep (SHA/Hyperband) using shared SQLite on artifacts volume.
+
+    ``n_trials`` and ``timeout_hours`` are interpreted as **chain-wide
+    budgets**, not per-container limits. Modal caps a single function
+    invocation at 24h, so when the budget exceeds that this function
+    spawns a successor (``run_optuna_study.spawn(...)``) just before
+    exiting. Each successor reattaches to the shared SQLite study via
+    ``load_if_exists=True`` and uses the salvage path to recover the
+    orphaned RUNNING trial from its predecessor. Total work across the
+    chain converges to ``n_trials`` finished trials or ``timeout_hours``
+    of wall-clock, whichever comes first.
+    """
     if base_config_dict is not None:
         base_config = SAM3LoRAConfig.model_validate(base_config_dict)
     else:
@@ -818,29 +897,269 @@ def run_optuna_study(
             f"trial={trial.number} state={trial.state.name}"
         )
 
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        timeout=int(timeout_hours * 3600),
-        gc_after_trial=True,
-        show_progress_bar=True,
-        n_jobs=max(1, parallel_workers),
-        callbacks=[_commit_after_trial],
+    # Compute chain-wide budget remaining. The successor of a 24h-killed
+    # container reads these numbers off the shared Optuna DB rather than
+    # via plumbed args, so a chain can be re-launched manually if needed
+    # and still pick up the right "trials/hours left" automatically.
+    chain_started_at = _chain_started_at(study)
+    elapsed_chain_hours = (datetime.now() - chain_started_at).total_seconds() / 3600.0
+    finished_at_start = _count_finished_trials(study)
+    remaining_trials = max(0, n_trials - finished_at_start)
+    remaining_chain_hours = max(0.0, timeout_hours - elapsed_chain_hours)
+    per_container_hours = min(remaining_chain_hours, _PER_CONTAINER_MAX_HOURS)
+
+    print(
+        f"[sweep][chain] finished_trials={finished_at_start}/{n_trials}, "
+        f"elapsed={elapsed_chain_hours:.2f}h/{timeout_hours:.2f}h, "
+        f"per_container_budget={per_container_hours:.2f}h"
     )
 
-    # Final sync at the end of the sweep: commit so any downstream reader
-    # (deployed `describe_current_leader`, ad-hoc scripts, etc.) sees the
-    # finalized state of the study, dispose the Optuna sqlite handle so
-    # the volume reload below doesn't trip over open files, then reload so
-    # any in-process logic that inspects the filesystem after this point
-    # can see checkpoints committed from parallel training containers.
+    if remaining_trials <= 0 or per_container_hours <= 0:
+        print(
+            "[sweep][chain] chain budget already exhausted before optimize; "
+            "skipping study.optimize and not spawning a successor."
+        )
+    else:
+        study.optimize(
+            objective,
+            n_trials=remaining_trials,
+            timeout=int(per_container_hours * 3600),
+            gc_after_trial=True,
+            show_progress_bar=True,
+            n_jobs=max(1, parallel_workers),
+            callbacks=[_commit_after_trial],
+        )
+
+    # Final sync at the end of this container's slice: commit so any
+    # downstream reader (deployed `describe_current_leader`, ad-hoc
+    # scripts, the spawned successor) sees the finalized state of the
+    # study, dispose the Optuna sqlite handle so the volume reload below
+    # doesn't trip over open files, then reload so any in-process logic
+    # that inspects the filesystem after this point can see checkpoints
+    # committed from parallel training containers.
     _commit_and_reload_artifacts("end of run_optuna_study", study=study)
 
-    _print_study_results(
-        study,
-        rerank_top_fraction=rerank_top_fraction,
-        objective_mode=normalized_objective_mode,
+    finished_after = _count_finished_trials(study)
+    new_finished = finished_after - finished_at_start
+    elapsed_after_hours = (datetime.now() - chain_started_at).total_seconds() / 3600.0
+
+    # Decide whether to hand off to a fresh 24h container. Three stop
+    # conditions, any one of which terminates the chain:
+    #   1. Target trial count reached.
+    #   2. Total wall-clock budget exhausted (with a 30-min buffer so the
+    #      successor doesn't spin up only to immediately bail).
+    #   3. Safety stop: this container made zero progress. Without this
+    #      guard, a misconfigured run that fails on every trial would
+    #      respawn forever and burn the GPU budget on nothing.
+    target_reached = finished_after >= n_trials
+    timeout_reached = elapsed_after_hours + 0.5 >= timeout_hours
+    no_progress = new_finished == 0 and remaining_trials > 0 and per_container_hours > 0
+
+    if target_reached or timeout_reached or no_progress:
+        reasons: list[str] = []
+        if target_reached:
+            reasons.append(f"target trials reached ({finished_after}/{n_trials})")
+        if timeout_reached:
+            reasons.append(
+                f"chain timeout reached ({elapsed_after_hours:.2f}h/{timeout_hours:.2f}h)"
+            )
+        if no_progress:
+            reasons.append(
+                "container made zero progress on a non-empty budget (safety stop)"
+            )
+        print(f"[sweep][chain] not spawning successor: {'; '.join(reasons)}")
+
+        _print_study_results(
+            study,
+            rerank_top_fraction=rerank_top_fraction,
+            objective_mode=normalized_objective_mode,
+        )
+        return
+
+    print(
+        f"[sweep][chain] spawning successor: new_finished={new_finished}, "
+        f"finished_total={finished_after}/{n_trials}, "
+        f"elapsed={elapsed_after_hours:.2f}h/{timeout_hours:.2f}h"
     )
+    run_optuna_study.spawn(  # type: ignore[attr-defined]
+        n_trials=n_trials,
+        timeout_hours=timeout_hours,
+        study_name=study_name,
+        rerank_top_fraction=rerank_top_fraction,
+        parallel_workers=parallel_workers,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        pruner_type=pruner_type,
+        objective_mode=objective_mode,
+        cost_penalty_per_gpu_hour=cost_penalty_per_gpu_hour,
+        base_config_dict=base_config_dict,
+        salvage_orphaned_trials=salvage_orphaned_trials,
+    )
+
+
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=60 * 10,
+)
+def describe_leader_from_study(
+    study_name: str = "sam3-final-optuna-asha",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    num_rung_stages: int = NUM_RUNG_STAGES,
+    require_weights_on_disk: bool = True,
+) -> dict[str, Any]:
+    """Self-contained leader extraction.
+
+    Reads ``/artifacts/optuna/<study_name>.db`` directly and returns the
+    best trial's weights path + hyperparameters. **Does not** depend on
+    the ``tablebank-eval`` app being deployed -- this is the "give me the
+    leader without running anything through eval_tablebank" path.
+
+    Selection rules (for ``direction="minimize"``):
+      * Always considers ``COMPLETE`` trials.
+      * Optionally considers ``PRUNED`` trials (their last reported
+        intermediate value is used as the score).
+      * Optionally considers ``RUNNING`` trials (same; useful while a
+        sweep is in progress).
+      * Picks the trial with the lowest score whose stage output
+        directory contains a ``best_lora_weights.pt`` (or
+        ``last_lora_weights.pt``) file -- unless
+        ``require_weights_on_disk=False``, in which case it advertises
+        the conventional path even if not yet visible.
+
+    Returns a JSON-shaped dict with the leader info plus enough metadata
+    to drive a downstream evaluation or model-loading step.
+    """
+    artifacts_vol.reload()
+    sqlite_lock_timeout_sec = max(1, int(sqlite_lock_timeout_sec))
+    num_rung_stages = max(1, int(num_rung_stages))
+
+    sqlite_path = Path(MODAL_ARTIFACTS_DIR) / "optuna" / f"{study_name}.db"
+    if not sqlite_path.exists():
+        raise FileNotFoundError(
+            f"Optuna study DB not found at {sqlite_path}. "
+            "Make sure a sweep with this study_name has started and committed."
+        )
+
+    with sqlite3.connect(str(sqlite_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.commit()
+
+    storage_url = f"sqlite:///{sqlite_path.as_posix()}?timeout={sqlite_lock_timeout_sec}"
+    study = optuna.load_study(study_name=study_name, storage=storage_url)
+
+    candidates: list[dict[str, Any]] = []
+    state_counts: dict[str, int] = {}
+    for trial in study.trials:
+        state_counts[trial.state.name] = state_counts.get(trial.state.name, 0) + 1
+
+        score: float | None = None
+        if (
+            trial.state == optuna.trial.TrialState.COMPLETE
+            and trial.value is not None
+        ):
+            score = float(trial.value)
+        elif (
+            include_pruned_trials
+            and trial.state == optuna.trial.TrialState.PRUNED
+            and trial.intermediate_values
+        ):
+            latest_step = max(trial.intermediate_values.keys())
+            score = float(trial.intermediate_values[latest_step])
+        elif (
+            include_running_trials
+            and trial.state == optuna.trial.TrialState.RUNNING
+            and trial.intermediate_values
+        ):
+            latest_step = max(trial.intermediate_values.keys())
+            score = float(trial.intermediate_values[latest_step])
+
+        if score is None:
+            continue
+
+        # Resolve the stage output dir for this trial.
+        stage_output_dir = trial.user_attrs.get(f"stage_{num_rung_stages}_output_dir")
+        if not isinstance(stage_output_dir, str):
+            stage_keys = sorted(
+                k
+                for k in trial.user_attrs.keys()
+                if k.startswith("stage_") and k.endswith("_output_dir")
+            )
+            if stage_keys:
+                stage_output_dir = trial.user_attrs[stage_keys[-1]]
+        if not isinstance(stage_output_dir, str):
+            continue
+
+        weights_candidates = [
+            Path(stage_output_dir) / "best_lora_weights.pt",
+            Path(stage_output_dir) / "last_lora_weights.pt",
+        ]
+        visible_weights = next(
+            (p for p in weights_candidates if p.exists()), None
+        )
+        if visible_weights is None and require_weights_on_disk:
+            continue
+        weights_path_str = (
+            str(visible_weights)
+            if visible_weights is not None
+            else str(weights_candidates[0])
+        )
+
+        candidates.append(
+            {
+                "trial_number": trial.number,
+                "state": trial.state.name,
+                "score": score,
+                "output_dir": stage_output_dir,
+                "weights_path": weights_path_str,
+                "weights_visible_on_disk": visible_weights is not None,
+                "objective_mode": trial.user_attrs.get("objective_mode"),
+                "final_stage_val_loss": trial.user_attrs.get("final_stage_val_loss"),
+                "trial_runtime_hours": trial.user_attrs.get("trial_runtime_hours"),
+                "salvage_origin_trial_number": trial.user_attrs.get(
+                    "salvage_origin_trial_number"
+                ),
+                "hyperparameters": dict(trial.params),
+            }
+        )
+
+    if not candidates:
+        return {
+            "study_name": study_name,
+            "sqlite_path": str(sqlite_path),
+            "total_trials": len(study.trials),
+            "trial_state_counts": state_counts,
+            "leader_trial_number": None,
+            "leader_state": None,
+            "leader_score": None,
+            "weights_path": None,
+            "output_dir": None,
+            "hyperparameters": {},
+            "reason": (
+                "No trial with a usable score and weights path was found. "
+                "Wait for at least one stage to finish, or relax the filters "
+                "via include_running_trials / require_weights_on_disk."
+            ),
+        }
+
+    best = min(candidates, key=lambda c: c["score"])
+    return {
+        "study_name": study_name,
+        "sqlite_path": str(sqlite_path),
+        "total_trials": len(study.trials),
+        "trial_state_counts": state_counts,
+        "leader_trial_number": best["trial_number"],
+        "leader_state": best["state"],
+        "leader_score": best["score"],
+        "weights_path": best["weights_path"],
+        "weights_visible_on_disk": best["weights_visible_on_disk"],
+        "output_dir": best["output_dir"],
+        "objective_mode": best["objective_mode"],
+        "final_stage_val_loss": best["final_stage_val_loss"],
+        "trial_runtime_hours": best["trial_runtime_hours"],
+        "salvage_origin_trial_number": best["salvage_origin_trial_number"],
+        "hyperparameters": best["hyperparameters"],
+    }
 
 
 @app.local_entrypoint()
@@ -857,6 +1176,24 @@ def main(
     auto_deploy_tablebank_eval: bool = True,
     salvage_orphaned_trials: bool = True,
 ):
+    """Kick off the chained Optuna sweep.
+
+    ``n_trials`` and ``timeout_hours`` are **chain-wide** budgets. Modal
+    caps any single function call at 24h, so for budgets longer than
+    that, ``run_optuna_study`` self-respawns via ``Function.spawn`` and
+    each successor reattaches to the shared SQLite study. The chain ends
+    when the trial target is hit, the wall-clock budget is hit, or a
+    container makes zero progress (safety stop).
+
+    Recommended usage for budgets that exceed 24h: launch with ``--detach``
+    so the local process can disconnect once the first container is up::
+
+        modal run --detach final_optuna_asha_sweep.py \\
+            --n-trials 120 --timeout-hours 120
+
+    After ``--detach`` returns, your laptop is no longer in the critical
+    path; the chain runs entirely on Modal until budget exhaustion.
+    """
     config_path = (
         Path(__file__).resolve().parent
         / "sam3_table"
@@ -886,3 +1223,110 @@ def main(
         base_config_dict=base_config.model_dump(mode="json"),
         salvage_orphaned_trials=salvage_orphaned_trials,
     )
+
+
+@app.local_entrypoint()
+def show_current_leader(
+    study_name: str = "sam3-final-optuna-asha",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    require_weights_on_disk: bool = True,
+):
+    """Print the current best trial in this study as JSON.
+
+    Self-contained -- reads the Optuna sqlite DB on ``artifacts-vol``
+    directly and does not require ``tablebank-eval`` to be deployed.
+
+    Examples:
+        modal run final_optuna_asha_sweep.py::show_current_leader
+        modal run final_optuna_asha_sweep.py::show_current_leader \\
+            --study-name sam3-final-optuna-asha-v2
+        modal run final_optuna_asha_sweep.py::show_current_leader \\
+            --include-running-trials
+    """
+    result = describe_leader_from_study.remote(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        include_pruned_trials=include_pruned_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        num_rung_stages=NUM_RUNG_STAGES,
+        require_weights_on_disk=require_weights_on_disk,
+    )
+    print(json.dumps(result, indent=2, default=str))
+
+
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=60 * 10,
+)
+def _read_leader_weights_bytes(
+    study_name: str = "sam3-final-optuna-asha",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+) -> dict[str, Any]:
+    """Resolve the current leader and return its weights file as bytes
+    plus minimal metadata. Used by :func:`download_leader_weights`.
+    """
+    leader = describe_leader_from_study.local(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        include_pruned_trials=include_pruned_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        num_rung_stages=NUM_RUNG_STAGES,
+        require_weights_on_disk=True,
+    )
+    weights_path = leader.get("weights_path")
+    if not isinstance(weights_path, str) or not Path(weights_path).exists():
+        raise FileNotFoundError(
+            f"No leader weights file found for study '{study_name}'. "
+            f"Got leader info: {leader}"
+        )
+    data = Path(weights_path).read_bytes()
+    return {
+        "leader_trial_number": leader["leader_trial_number"],
+        "leader_score": leader["leader_score"],
+        "remote_weights_path": weights_path,
+        "weights_bytes": data,
+        "hyperparameters": leader["hyperparameters"],
+    }
+
+
+@app.local_entrypoint()
+def download_leader_weights(
+    study_name: str = "sam3-final-optuna-asha",
+    output_path: str = "leader_weights.pt",
+    include_running_trials: bool = False,
+    include_pruned_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+):
+    """Download the current leader's LoRA weights file to a local path.
+
+    Self-contained -- does not require ``tablebank-eval`` to be deployed.
+
+    Examples:
+        modal run final_optuna_asha_sweep.py::download_leader_weights
+        modal run final_optuna_asha_sweep.py::download_leader_weights \\
+            --study-name sam3-final-optuna-asha-v2 \\
+            --output-path ./best_lora_weights.pt
+    """
+    payload = _read_leader_weights_bytes.remote(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        include_pruned_trials=include_pruned_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+    )
+    local_target = Path(output_path).resolve()
+    local_target.parent.mkdir(parents=True, exist_ok=True)
+    local_target.write_bytes(payload["weights_bytes"])
+    summary = {
+        "study_name": study_name,
+        "leader_trial_number": payload["leader_trial_number"],
+        "leader_score": payload["leader_score"],
+        "remote_weights_path": payload["remote_weights_path"],
+        "local_weights_path": str(local_target),
+        "bytes_written": len(payload["weights_bytes"]),
+        "hyperparameters": payload["hyperparameters"],
+    }
+    print(json.dumps(summary, indent=2, default=str))
