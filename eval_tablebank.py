@@ -6,7 +6,8 @@ import os
 import random
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,51 @@ MODAL_DATA_DIR = "/data"
 MODAL_ARTIFACTS_DIR = "/artifacts"
 BPE_VOCAB_URL = "https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz"
 BPE_CACHE_PATH = Path("/tmp/bpe_simple_vocab_16e6.txt.gz")
+DEFAULT_STUDY_NAME = "sam3-final-optuna-asha"
+DEFAULT_NUM_RUNG_STAGES = 5
+
+
+def ensure_deployed(
+    *,
+    environment_name: str | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Deploy the ``tablebank-eval`` app if it isn't already deployed.
+
+    This is intended to be called from local entrypoints (e.g. the Optuna
+    sweeps) before any remote work tries to resolve
+    ``modal.Function.from_name("tablebank-eval", ...)``. Deploying is
+    idempotent on Modal's side, but we still gate on a cheap app lookup so
+    we don't pay for a redeploy on every run.
+    """
+    try:
+        modal.App.lookup(app.name, environment_name=environment_name)
+        if verbose:
+            print(f"[eval_tablebank] App '{app.name}' already deployed; skipping deploy.")
+        return {"already_deployed": True, "app_name": app.name}
+    except modal.exception.NotFoundError:
+        if verbose:
+            print(
+                f"[eval_tablebank] App '{app.name}' not deployed in environment "
+                f"{environment_name or '<default>'}; deploying now so leader "
+                "extraction can resolve it..."
+            )
+        from modal.runner import deploy_app
+
+        result = deploy_app(app, environment_name=environment_name)
+        app_id = getattr(result, "app_id", None)
+        app_page_url = getattr(result, "app_page_url", None)
+        if verbose:
+            print(
+                f"[eval_tablebank] Deployed '{app.name}' (app_id={app_id}). "
+                f"View: {app_page_url}"
+            )
+        return {
+            "already_deployed": False,
+            "app_name": app.name,
+            "app_id": app_id,
+            "app_page_url": app_page_url,
+        }
 
 
 @dataclass(frozen=True)
@@ -198,6 +244,17 @@ def _load_config(
             json.loads(resolved_config_path.read_text())
         )
     return SAM3LoRAConfig.from_yaml(resolved_config_path)
+
+
+def _latest_stage_attr(user_attrs: dict[str, Any], suffix: str) -> Any | None:
+    stage_keys = sorted(
+        key
+        for key in user_attrs.keys()
+        if key.startswith("stage_") and key.endswith(f"_{suffix}")
+    )
+    if not stage_keys:
+        return None
+    return user_attrs[stage_keys[-1]]
 
 
 def resolve_bpe_vocab_path() -> str:
@@ -382,6 +439,162 @@ def _render_eval_visualizations(
         "visualizations_dir": str(vis_dir),
         "num_visualizations": len(saved_files),
         "files": saved_files,
+    }
+
+
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=60 * 10,
+)
+def get_current_optuna_leader(
+    study_name: str = DEFAULT_STUDY_NAME,
+    include_running_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
+) -> dict[str, Any]:
+    import importlib
+
+    optuna = importlib.import_module("optuna")
+
+    artifacts_vol.reload()
+    sqlite_lock_timeout_sec = max(1, int(sqlite_lock_timeout_sec))
+    num_rung_stages = max(1, int(num_rung_stages))
+
+    sqlite_path = Path(MODAL_ARTIFACTS_DIR) / "optuna" / f"{study_name}.db"
+    if not sqlite_path.exists():
+        raise FileNotFoundError(
+            f"Optuna study DB was not found at {sqlite_path}. "
+            "Make sure the ASHA sweep has started and wrote the study database."
+        )
+
+    with sqlite3.connect(str(sqlite_path)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.commit()
+
+    storage_url = f"sqlite:///{sqlite_path.as_posix()}?timeout={sqlite_lock_timeout_sec}"
+    study = optuna.load_study(study_name=study_name, storage=storage_url)
+
+    best_row: dict[str, Any] | None = None
+    for trial in study.trials:
+        score: float | None = None
+        if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None:
+            score = float(trial.value)
+        elif include_running_trials and trial.intermediate_values:
+            latest_step = max(trial.intermediate_values.keys())
+            score = float(trial.intermediate_values[latest_step])
+
+        if score is None:
+            continue
+
+        stage_output_dir = trial.user_attrs.get(f"stage_{num_rung_stages}_output_dir")
+        if not isinstance(stage_output_dir, str):
+            stage_output_dir = _latest_stage_attr(trial.user_attrs, "output_dir")
+        if not isinstance(stage_output_dir, str):
+            continue
+
+        weights_candidates = [
+            Path(stage_output_dir) / "best_lora_weights.pt",
+            Path(stage_output_dir) / "last_lora_weights.pt",
+        ]
+        weights_path = next((p for p in weights_candidates if p.exists()), None)
+        if weights_path is None:
+            continue
+
+        row = {
+            "trial_number": trial.number,
+            "state": trial.state.name,
+            "score": score,
+            "output_dir": stage_output_dir,
+            "weights_path": str(weights_path),
+            "run_config_path": str(Path(stage_output_dir) / "run_config.json"),
+            "final_stage_val_loss": trial.user_attrs.get("final_stage_val_loss"),
+            "objective_mode": trial.user_attrs.get("objective_mode"),
+            "hyperparameters": dict(trial.params),
+        }
+        if best_row is None or row["score"] < best_row["score"]:
+            best_row = row
+
+    if best_row is None:
+        raise RuntimeError(
+            f"No leader candidate found for study '{study_name}'. "
+            "Need at least one trial with an output_dir and available LoRA weights."
+        )
+
+    return best_row
+
+
+@app.function(
+    image=TABLEBANK_IMAGE,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+    volumes={MODAL_DATA_DIR: tablebank_vol, MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=3600 * 24,
+)
+def run_tablebank_eval_on_current_leader(
+    study_name: str = DEFAULT_STUDY_NAME,
+    dataset_root: str = "/data/tablebank/extracted/TableBank/TableBank/Detection",
+    annotations_path: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
+    output_root_dir: str = "/artifacts/tablebank_eval_leaders",
+    score_threshold: float = 0.25,
+    query_text: str = "table",
+    batch_size: int = 8,
+    visualize_max_images: int = 20,
+    include_running_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
+) -> dict[str, Any]:
+    leader = get_current_optuna_leader.local(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        num_rung_stages=num_rung_stages,
+    )
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    study_slug = "".join(char if (char.isalnum() or char in "-_.") else "_" for char in study_name)
+    leader_output_dir = (
+        f"{output_root_dir.rstrip('/')}"
+        f"/{study_slug}/trial_{int(leader['trial_number']):04d}_{timestamp}"
+    )
+    # Keep benchmark artifacts outside trial output dirs so sweep ranking is unchanged.
+    result = run_tablebank_eval.remote(
+        weights_path=str(leader["weights_path"]),
+        dataset_root=dataset_root,
+        annotations_path=annotations_path,
+        output_dir=leader_output_dir,
+        score_threshold=score_threshold,
+        query_text=query_text,
+        batch_size=batch_size,
+        visualize_max_images=visualize_max_images,
+    )
+    result["leader"] = leader
+    result["benchmark_output_dir"] = leader_output_dir
+    return result
+
+
+@app.function(
+    volumes={MODAL_ARTIFACTS_DIR: artifacts_vol},
+    timeout=60 * 10,
+)
+def describe_current_leader(
+    study_name: str = DEFAULT_STUDY_NAME,
+    include_running_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
+) -> dict[str, Any]:
+    leader = get_current_optuna_leader.local(
+        study_name=study_name,
+        include_running_trials=include_running_trials,
+        sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+        num_rung_stages=num_rung_stages,
+    )
+    return {
+        "study_name": study_name,
+        "leader_trial_number": leader["trial_number"],
+        "leader_state": leader["state"],
+        "leader_score": leader["score"],
+        "objective_mode": leader.get("objective_mode"),
+        "weights_path": leader["weights_path"],
+        "output_dir": leader["output_dir"],
+        "hyperparameters": leader.get("hyperparameters", {}),
     }
 
 
@@ -773,7 +986,7 @@ def run_tablebank_eval(
 
 @app.local_entrypoint()
 def main(
-    weights: str,
+    weights: str = "",
     dataset_root: str = "/data/tablebank/extracted/TableBank/TableBank/Detection",
     annotations: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
     output_dir: str = "/artifacts/tablebank_eval",
@@ -786,6 +999,12 @@ def main(
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
+    use_current_leader: bool = False,
+    study_name: str = DEFAULT_STUDY_NAME,
+    include_running_trials: bool = True,
+    sqlite_lock_timeout_sec: int = 60,
+    num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
+    show_current_leader_only: bool = False,
 ):
     result = run_tablebank_eval.remote(
         weights_path=weights,
@@ -802,5 +1021,41 @@ def main(
         batch_size=batch_size,
         visualize_max_images=visualize_max_images,
     )
+    if show_current_leader_only:
+        result = describe_current_leader.remote(
+            study_name=study_name,
+            include_running_trials=include_running_trials,
+            sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+            num_rung_stages=num_rung_stages,
+        )
+    elif use_current_leader:
+        result = run_tablebank_eval_on_current_leader.remote(
+            study_name=study_name,
+            dataset_root=dataset_root,
+            annotations_path=annotations,
+            output_root_dir=output_dir,
+            score_threshold=score_threshold,
+            query_text=query_text,
+            batch_size=batch_size,
+            visualize_max_images=visualize_max_images,
+            include_running_trials=include_running_trials,
+            sqlite_lock_timeout_sec=sqlite_lock_timeout_sec,
+            num_rung_stages=num_rung_stages,
+        )
+    else:
+        if not weights:
+            raise ValueError(
+                "weights is required unless use_current_leader=True."
+            )
+        result = run_tablebank_eval.remote(
+            weights_path=weights,
+            dataset_root=dataset_root,
+            annotations_path=annotations,
+            output_dir=output_dir,
+            score_threshold=score_threshold,
+            query_text=query_text,
+            batch_size=batch_size,
+            visualize_max_images=visualize_max_images,
+        )
     print(json.dumps(result, indent=2, default=_json_default))
 
