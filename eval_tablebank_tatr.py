@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import json
-import os
 import random
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,35 +10,26 @@ from typing import Any
 import modal
 
 from sam3_table.coco_schema import COCODataset
-from voc_to_coco import convert_voc_to_coco 
+from voc_to_coco import convert_voc_to_coco
 
-TABLEBANK_R101_CONFIG_URL = (
-    "https://huggingface.co/layoutparser/detectron2/resolve/main/"
-    "TableBank/faster_rcnn_R_101_FPN_3x/config.yml"
-)
-TABLEBANK_R101_WEIGHTS_URL = (
-    "https://huggingface.co/layoutparser/detectron2/resolve/main/"
-    "TableBank/faster_rcnn_R_101_FPN_3x/model_final.pth"
-)
+DEFAULT_TATR_MODEL_NAME = "microsoft/table-transformer-detection"
+DEFAULT_TABLE_CLASS_NAMES = ("table", "table rotated")
 
-DETECTRON2_TABLEBANK_IMAGE = (
+TATR_TABLEBANK_IMAGE = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "git",
-        "gcc",
-        "g++",
         "libgl1",
         "libglib2.0-0",
         "libsm6",
         "libxext6",
     )
     .pip_install_from_requirements("requirements.txt")
-    .pip_install_from_requirements("requirements-detectron2.txt")
     .add_local_python_source("sam3_table")
     .add_local_file("voc_to_coco.py", remote_path="/root/voc_to_coco.py")
 )
 
-app = modal.App(name="tablebank-detectron2-eval", image=DETECTRON2_TABLEBANK_IMAGE)
+app = modal.App(name="tablebank-tatr-eval", image=TATR_TABLEBANK_IMAGE)
 
 tablebank_vol = modal.Volume.from_name("tablebank-vol")
 artifacts_vol = modal.Volume.from_name("artifacts-vol", create_if_missing=True)
@@ -307,54 +295,28 @@ def _select_detection_subset(
     return [items[idx] for idx in selected_indices]
 
 
-def _resolve_model_input(
-    file_or_url: str,
-    download_dir: Path,
-    fallback_name: str,
-) -> Path:
-    """Resolve a local path or download a URL into *download_dir*."""
-    parsed = urllib.parse.urlparse(file_or_url)
-    if parsed.scheme in {"http", "https"}:
-        download_dir.mkdir(parents=True, exist_ok=True)
-        raw_name = Path(parsed.path).name or fallback_name
-        filename = raw_name if "." in raw_name else fallback_name
-        local_path = download_dir / filename
-        if not local_path.exists():
-            print(f"Downloading {file_or_url} -> {local_path}")
-            urllib.request.urlretrieve(file_or_url, local_path)
-        else:
-            print(f"Reusing downloaded file {local_path}")
-        return local_path
-
-    local_path = Path(file_or_url)
-    if not local_path.exists():
-        raise FileNotFoundError(f"Model file not found: {local_path}")
-    return local_path
-
-
 @app.function(
     gpu="T4",
-    image=DETECTRON2_TABLEBANK_IMAGE,
+    image=TATR_TABLEBANK_IMAGE,
     volumes={MODAL_DATA_DIR: tablebank_vol, MODAL_ARTIFACTS_DIR: artifacts_vol},
     timeout=3600 * 24,
 )
-def run_tablebank_detectron2_eval(
-    config: str,
-    weights: str,
+def run_tablebank_tatr_eval(
     dataset_root: str,
     annotations_path: str,
     output_dir: str,
+    model_name: str = DEFAULT_TATR_MODEL_NAME,
     score_threshold: float = 0.9,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
     visualize_max_images: int = 20,
+    class_names: str = ",".join(DEFAULT_TABLE_CLASS_NAMES),
 ) -> dict[str, Any]:
-    from detectron2.config import get_cfg
-    from detectron2.engine import DefaultPredictor
-    import numpy as np
+    import torch
     from PIL import Image as PILImage
     from pycocotools.coco import COCO
     from pycocotools.cocoeval import COCOeval
+    from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
     tablebank_vol.reload()
     artifacts_vol.reload()
@@ -364,16 +326,13 @@ def run_tablebank_detectron2_eval(
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    downloads_dir = output_dir_path / "_downloads"
-    resolved_config_path = _resolve_model_input(config, downloads_dir, "config.yaml")
-    resolved_weights_path = _resolve_model_input(weights, downloads_dir, "model_final.pth")
-
     resolved_annotations_input, annotations_format = _resolve_annotations_source(
         annotations_root_path,
         dataset_root_path,
     )
     if dataset_fraction <= 0.0 or dataset_fraction > 1.0:
         raise ValueError("dataset_fraction must be in the range (0.0, 1.0].")
+
     if annotations_format == "voc":
         resolved_annotations_path = output_dir_path / "tablebank_annotations.coco.json"
         convert_voc_to_coco(
@@ -439,25 +398,59 @@ def run_tablebank_detectron2_eval(
     ]
     selected_categories = [category.model_dump() for category in coco_dataset.categories]
 
-    cfg = get_cfg()
-    cfg.merge_from_file(str(resolved_config_path))
-    cfg.MODEL.WEIGHTS = str(resolved_weights_path)
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = score_threshold
-    cfg.MODEL.DEVICE = "cuda"
-    predictor = DefaultPredictor(cfg)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    image_processor = AutoImageProcessor.from_pretrained(model_name)
+    model = TableTransformerForObjectDetection.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+
+    requested_class_names = {
+        item.strip().lower()
+        for item in class_names.split(",")
+        if item.strip()
+    }
+    if not requested_class_names:
+        raise ValueError("class_names must include at least one label.")
+
+    id2label = {
+        int(label_id): str(label_name).lower()
+        for label_id, label_name in model.config.id2label.items()
+    }
+    valid_label_ids = {
+        label_id
+        for label_id, label_name in id2label.items()
+        if label_name in requested_class_names
+    }
+    if not valid_label_ids:
+        raise ValueError(
+            f"Could not match requested labels {sorted(requested_class_names)} against "
+            f"model labels {sorted(set(id2label.values()))}"
+        )
 
     predictions: list[dict[str, Any]] = []
     next_prediction_id = 0
     for idx, item in enumerate(detection_images, start=1):
         image_rgb = PILImage.open(item.image_path).convert("RGB")
-        image_bgr = np.asarray(image_rgb)[:, :, ::-1].copy()
+        inputs = image_processor(images=image_rgb, return_tensors="pt")
+        inputs = {name: value.to(device) for name, value in inputs.items()}
 
-        outputs = predictor(image_bgr)
-        instances = outputs["instances"].to("cpu")
-        boxes = instances.pred_boxes.tensor.tolist() if instances.has("pred_boxes") else []
-        scores = instances.scores.tolist() if instances.has("scores") else []
+        with torch.inference_mode():
+            outputs = model(**inputs)
 
-        for box_xyxy, score in zip(boxes, scores):
+        target_sizes = torch.tensor([(image_rgb.height, image_rgb.width)], device=device)
+        results = image_processor.post_process_object_detection(
+            outputs,
+            threshold=score_threshold,
+            target_sizes=target_sizes,
+        )[0]
+
+        boxes = results["boxes"].detach().cpu().tolist()
+        scores = results["scores"].detach().cpu().tolist()
+        labels = results["labels"].detach().cpu().tolist()
+
+        for box_xyxy, score, label_id in zip(boxes, scores, labels):
+            if int(label_id) not in valid_label_ids:
+                continue
             x1, y1, x2, y2 = box_xyxy
             w = max(0.0, x2 - x1)
             h = max(0.0, y2 - y1)
@@ -470,6 +463,8 @@ def run_tablebank_detectron2_eval(
                     "category_id": 1,
                     "bbox": [float(x1), float(y1), float(w), float(h)],
                     "score": float(score),
+                    "label_id": int(label_id),
+                    "label_name": id2label[int(label_id)],
                 }
             )
             next_prediction_id += 1
@@ -521,11 +516,10 @@ def run_tablebank_detectron2_eval(
     }
     summary = {
         "summary_version": "tablebank_eval.v1",
-        "baseline_id": "detectron2",
-        "baseline_name": "TableBank Detectron2 R101 FPN 3x",
-        "model_family": "detectron2",
-        "config_path": str(resolved_config_path),
-        "weights_path": str(resolved_weights_path),
+        "baseline_id": "detr",
+        "baseline_name": "TATR DETR R18",
+        "model_family": "detr",
+        "model_name": model_name,
         "dataset_root": str(dataset_root_path),
         "annotations_path": str(resolved_annotations_path),
         "output_dir": str(output_dir_path),
@@ -534,12 +528,14 @@ def run_tablebank_detectron2_eval(
         "score_threshold": score_threshold,
         "dataset_fraction": dataset_fraction,
         "sample_seed": sample_seed,
+        "class_names": sorted(requested_class_names),
+        "device": device,
         "model": {
-            "family": "detectron2",
-            "variant": "faster_rcnn_R_101_FPN_3x",
-            "config_path": str(resolved_config_path),
-            "weights_path": str(resolved_weights_path),
-            "device": "cuda",
+            "family": "detr",
+            "variant": "table-transformer-detection",
+            "model_name": model_name,
+            "class_names": sorted(requested_class_names),
+            "device": device,
         },
         "evaluation": {
             "task": "table_detection",
@@ -555,6 +551,7 @@ def run_tablebank_detectron2_eval(
             "visualize_max_images": visualize_max_images,
         },
         "parameters": {
+            "class_names": sorted(requested_class_names),
             "score_threshold": score_threshold,
         },
         "metrics": metrics,
@@ -575,25 +572,25 @@ def run_tablebank_detectron2_eval(
 
 @app.local_entrypoint()
 def main(
-    config: str = TABLEBANK_R101_CONFIG_URL,
-    weights: str = TABLEBANK_R101_WEIGHTS_URL,
     dataset_root: str = "/data/tablebank/extracted/TableBank/TableBank/Detection",
     annotations: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
-    output_dir: str = "/artifacts/tablebank_detectron2_eval",
+    output_dir: str = "/artifacts/tablebank_tatr_eval",
+    model_name: str = DEFAULT_TATR_MODEL_NAME,
     score_threshold: float = 0.9,
     dataset_fraction: float = 1.0,
     sample_seed: int | None = None,
     visualize_max_images: int = 20,
+    class_names: str = ",".join(DEFAULT_TABLE_CLASS_NAMES),
 ):
-    result = run_tablebank_detectron2_eval.remote(
-        config=config,
-        weights=weights,
+    result = run_tablebank_tatr_eval.remote(
         dataset_root=dataset_root,
         annotations_path=annotations,
         output_dir=output_dir,
+        model_name=model_name,
         score_threshold=score_threshold,
         dataset_fraction=dataset_fraction,
         sample_seed=sample_seed,
         visualize_max_images=visualize_max_images,
+        class_names=class_names,
     )
     print(json.dumps(result, indent=2, default=_json_default))

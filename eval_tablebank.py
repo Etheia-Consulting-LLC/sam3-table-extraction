@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import random
 import urllib.request
 from dataclasses import dataclass
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import modal
 from sam3_table.coco_schema import COCODataset
 from sam3_table.lora_layers import LoRAConfig as LoRALayerConfig
 from sam3_table.lora_layers import apply_lora_to_model
+from sam3_table.postprocess import postprocess_sam3_predictions
 from sam3_table.training_config import SAM3LoRAConfig
 from voc_to_coco import convert_voc_to_coco
 
@@ -199,6 +201,39 @@ def _resolve_config_path(
     )
 
 
+def _prepare_output_dir(
+    output_dir_path: Path,
+    score_threshold: float,
+    unique_output_dir: bool,
+) -> Path:
+    if not unique_output_dir:
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+        return output_dir_path
+
+    threshold_tag = f"t{int(round(score_threshold * 100)):03d}"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_output_dir = output_dir_path / f"{timestamp}_{threshold_tag}"
+    run_output_dir.mkdir(parents=True, exist_ok=False)
+    return run_output_dir
+
+
+def _select_detection_subset(
+    items: list[DetectionImage],
+    dataset_fraction: float,
+    sample_seed: int | None,
+) -> list[DetectionImage]:
+    if dataset_fraction >= 1.0 or not items:
+        return items
+
+    subset_size = max(1, int(len(items) * dataset_fraction))
+    if sample_seed is None:
+        return items[:subset_size]
+
+    rng = random.Random(sample_seed)
+    selected_indices = sorted(rng.sample(range(len(items)), k=subset_size))
+    return [items[idx] for idx in selected_indices]
+
+
 def _load_config(
     weights_path: Path,
     config_path: str | Path | None,
@@ -234,60 +269,6 @@ def resolve_bpe_vocab_path() -> str:
     print(f"Downloading SAM3 BPE vocab to {BPE_CACHE_PATH}...")
     urllib.request.urlretrieve(BPE_VOCAB_URL, BPE_CACHE_PATH)
     return str(BPE_CACHE_PATH)
-
-
-def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
-    if len(binary_masks) == 0:
-        return binary_masks, scores, boxes
-
-    import torch
-
-    sorted_indices = torch.argsort(scores, descending=True)
-    binary_masks = binary_masks[sorted_indices]
-    scores = scores[sorted_indices]
-    boxes = boxes[sorted_indices]
-
-    merged_masks = []
-    merged_scores = []
-    merged_boxes = []
-    used = torch.zeros(len(binary_masks), dtype=torch.bool)
-
-    for i in range(len(binary_masks)):
-        if used[i]:
-            continue
-
-        current_mask = binary_masks[i].clone()
-        current_score = scores[i].item()
-        current_box = boxes[i]
-        used[i] = True
-
-        for j in range(i + 1, len(binary_masks)):
-            if used[j]:
-                continue
-
-            intersection = (current_mask & binary_masks[j]).sum().item()
-            union = (current_mask | binary_masks[j]).sum().item()
-            iou = intersection / union if union > 0 else 0
-
-            if iou > iou_threshold:
-                current_mask = current_mask | binary_masks[j]
-                current_score = max(current_score, scores[j].item())
-                used[j] = True
-
-        merged_masks.append(current_mask)
-        merged_scores.append(current_score)
-        merged_boxes.append(current_box)
-
-    if len(merged_masks) > 0:
-        merged_masks = torch.stack(merged_masks)
-        merged_scores = torch.tensor(merged_scores, device=scores.device)
-        merged_boxes = torch.stack(merged_boxes)
-    else:
-        merged_masks = binary_masks[:0]
-        merged_scores = scores[:0]
-        merged_boxes = boxes[:0]
-
-    return merged_masks, merged_scores, merged_boxes
 
 
 def _bbox_iou_xywh(box_a: list[float], box_b: list[float]) -> float:
@@ -630,6 +611,11 @@ def run_tablebank_eval(
     annotations_path: str,
     output_dir: str,
     score_threshold: float = 0.25,
+    unique_output_dir: bool = False,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
@@ -658,8 +644,11 @@ def run_tablebank_eval(
 
     dataset_root_path = Path(dataset_root)
     annotations_root_path = Path(annotations_path)
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_dir_path = _prepare_output_dir(
+        Path(output_dir),
+        score_threshold=score_threshold,
+        unique_output_dir=unique_output_dir,
+    )
 
     resolved_weights_path = Path(weights_path)
     if not resolved_weights_path.exists():
@@ -669,6 +658,8 @@ def run_tablebank_eval(
         annotations_root_path,
         dataset_root_path,
     )
+    if dataset_fraction <= 0.0 or dataset_fraction > 1.0:
+        raise ValueError("dataset_fraction must be in the range (0.0, 1.0].")
     if annotations_format == "voc":
         resolved_annotations_path = output_dir_path / "tablebank_annotations.coco.json"
         convert_voc_to_coco(
@@ -715,6 +706,25 @@ def run_tablebank_eval(
             f"Could not locate {len(missing_files)} image(s) under {dataset_root_path}. "
             f"First missing entries: {preview}"
         )
+
+    detection_images = _select_detection_subset(
+        detection_images,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
+    )
+
+    selected_image_ids = {item.image_id for item in detection_images}
+    selected_annotations = [
+        annotation.model_dump(mode="json")
+        for annotation in coco_dataset.annotations
+        if annotation.image_id in selected_image_ids
+    ]
+    selected_images = [
+        image.model_dump()
+        for image in coco_dataset.images
+        if image.id in selected_image_ids
+    ]
+    selected_categories = [category.model_dump() for category in coco_dataset.categories]
 
     class _TableBankInferenceDataset(Dataset):
         def __init__(self, items: list[DetectionImage], normalized_query: str):
@@ -766,61 +776,18 @@ def run_tablebank_eval(
             if preds is None or len(preds.get("pred_logits", [])) == 0:
                 continue
 
-            logits = preds["pred_logits"]
-            boxes = preds["pred_boxes"]
-            masks = preds["pred_masks"]
+            processed_predictions = postprocess_sam3_predictions(
+                pred_logits=preds["pred_logits"],
+                pred_masks=preds["pred_masks"],
+                original_size=(item.height, item.width),
+                score_threshold=score_threshold,
+                duplicate_iou_threshold=duplicate_iou_threshold,
+                min_box_area=min_box_area,
+            )
 
-            scores = torch.sigmoid(logits).squeeze(-1)
-            valid_mask = scores > score_threshold
-            scores = scores[valid_mask]
-            boxes = boxes[valid_mask]
-            masks = masks[valid_mask]
-
-            if len(scores) == 0:
-                continue
-
-            masks_sigmoid = torch.sigmoid(masks)
-            masks_upsampled = torch.nn.functional.interpolate(
-                masks_sigmoid.unsqueeze(1).float(),
-                size=(item.height, item.width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            binary_masks = (masks_upsampled > 0.5).cpu()
-
-            del masks_sigmoid, masks_upsampled
-            torch.cuda.empty_cache()
-
-            if len(binary_masks) > 0:
-                binary_masks, scores, boxes = merge_overlapping_masks(
-                    binary_masks,
-                    scores.detach().cpu(),
-                    boxes.detach().cpu(),
-                    iou_threshold=0.3,
-                )
-
-            if len(binary_masks) == 0:
-                continue
-
-            for binary_mask, score, box in zip(
-                binary_masks,
-                scores.cpu().tolist(),
-                boxes.cpu().tolist(),
-            ):
-                cx, cy, w_norm, h_norm = box
-                x = (cx - w_norm / 2) * item.width
-                y = (cy - h_norm / 2) * item.height
-                w = w_norm * item.width
-                h = h_norm * item.height
-
-                x = max(0.0, min(x, item.width))
-                y = max(0.0, min(y, item.height))
-                w = max(0.0, min(w, item.width - x))
-                h = max(0.0, min(h, item.height - y))
-                if w < 1.0 or h < 1.0:
-                    continue
-
-                mask_np = binary_mask.numpy().astype(np.uint8)
+            for processed_prediction in processed_predictions:
+                x, y, w, h = processed_prediction.bbox_xywh
+                mask_np = processed_prediction.binary_mask.numpy().astype(np.uint8)
                 rle = mask_utils.encode(np.asfortranarray(mask_np))
                 rle["counts"] = rle["counts"].decode("utf-8")
                 encoded.append(
@@ -829,7 +796,7 @@ def run_tablebank_eval(
                         "image_id": item.image_id,
                         "category_id": 1,
                         "bbox": [float(x), float(y), float(w), float(h)],
-                        "score": float(score),
+                        "score": float(processed_prediction.score),
                         "segmentation": rle,
                     }
                 )
@@ -919,9 +886,9 @@ def run_tablebank_eval(
     predictions_path.write_text(json.dumps(predictions, indent=2, default=_json_default))
 
     gt_payload = {
-        "images": [image.model_dump() for image in coco_dataset.images],
-        "annotations": [annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
-        "categories": [category.model_dump() for category in coco_dataset.categories],
+        "images": selected_images,
+        "annotations": selected_annotations,
+        "categories": selected_categories,
         "info": {"description": "TableBank evaluation ground truth"},
     }
     gt_path = output_dir_path / "ground_truth.coco.json"
@@ -936,39 +903,78 @@ def run_tablebank_eval(
 
     prf_metrics = _match_detections_at_iou50(
         predictions=predictions,
-        annotations=[annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
+        annotations=selected_annotations,
     )
     visualization_summary = _render_eval_visualizations(
         detection_images=detection_images,
         predictions=predictions,
-        annotations=[annotation.model_dump(mode="json") for annotation in coco_dataset.annotations],
+        annotations=selected_annotations,
         output_dir_path=output_dir_path,
         max_images=visualize_max_images,
     )
+    metrics = {
+        "map": float(coco_eval.stats[0]),
+        "map50": float(coco_eval.stats[1]),
+        "map75": float(coco_eval.stats[2]),
+        "precision_iou50": float(prf_metrics["precision_iou50"]),
+        "recall_iou50": float(prf_metrics["recall_iou50"]),
+        "f1_iou50": float(prf_metrics["f1_iou50"]),
+        "true_positives": int(prf_metrics["true_positives"]),
+        "false_positives": int(prf_metrics["false_positives"]),
+        "false_negatives": int(prf_metrics["false_negatives"]),
+    }
     summary = {
+        "summary_version": "tablebank_eval.v1",
+        "baseline_id": "sam3lora",
+        "baseline_name": "SAM3 LoRA",
+        "model_family": "sam3",
         "weights_path": str(resolved_weights_path),
         "config_path": str(resolved_weights_path.with_name("run_config.json")),
         "dataset_root": str(dataset_root_path),
         "annotations_path": str(resolved_annotations_path),
+        "output_dir": str(output_dir_path),
         "num_images": len(detection_images),
         "num_predictions": len(predictions),
         "score_threshold": score_threshold,
+        "duplicate_iou_threshold": duplicate_iou_threshold,
+        "min_box_area": min_box_area,
+        "unique_output_dir": unique_output_dir,
+        "dataset_fraction": dataset_fraction,
+        "sample_seed": sample_seed,
         "query_text": normalized_query,
-        "metrics": {
-            "map": float(coco_eval.stats[0]),
-            "map50": float(coco_eval.stats[1]),
-            "map75": float(coco_eval.stats[2]),
-            "precision_iou50": float(prf_metrics["precision_iou50"]),
-            "recall_iou50": float(prf_metrics["recall_iou50"]),
-            "f1_iou50": float(prf_metrics["f1_iou50"]),
-            "true_positives": int(prf_metrics["true_positives"]),
-            "false_positives": int(prf_metrics["false_positives"]),
-            "false_negatives": int(prf_metrics["false_negatives"]),
+        "model": {
+            "family": "sam3",
+            "variant": "sam3-lora",
+            "weights_path": str(resolved_weights_path),
+            "config_path": str(resolved_weights_path.with_name("run_config.json")),
+            "device": device_obj.type,
         },
+        "evaluation": {
+            "task": "table_detection",
+            "dataset_name": "TableBank",
+            "dataset_root": str(dataset_root_path),
+            "annotations_path": str(resolved_annotations_path),
+            "output_dir": str(output_dir_path),
+            "num_images": len(detection_images),
+            "num_predictions": len(predictions),
+            "score_threshold": score_threshold,
+            "dataset_fraction": dataset_fraction,
+            "sample_seed": sample_seed,
+            "visualize_max_images": visualize_max_images,
+        },
+        "parameters": {
+            "query_text": normalized_query,
+            "batch_size": batch_size,
+            "duplicate_iou_threshold": duplicate_iou_threshold,
+            "min_box_area": min_box_area,
+            "unique_output_dir": unique_output_dir,
+        },
+        "metrics": metrics,
         "artifacts": {
             "predictions_coco_json": str(predictions_path),
             "ground_truth_coco_json": str(gt_path),
             "visualizations_dir": visualization_summary["visualizations_dir"],
+            "metrics_json": str(output_dir_path / "metrics.json"),
         },
         "visualizations": visualization_summary,
     }
@@ -985,6 +991,11 @@ def main(
     annotations: str = "/data/tablebank/extracted/TableBank/TableBank/Detection/annotations",
     output_dir: str = "/artifacts/tablebank_eval",
     score_threshold: float = 0.25,
+    unique_output_dir: bool = False,
+    dataset_fraction: float = 1.0,
+    sample_seed: int | None = None,
+    duplicate_iou_threshold: float = 0.5,
+    min_box_area: float = 16.0,
     query_text: str = "table",
     batch_size: int = 8,
     visualize_max_images: int = 20,
@@ -995,6 +1006,21 @@ def main(
     num_rung_stages: int = DEFAULT_NUM_RUNG_STAGES,
     show_current_leader_only: bool = False,
 ):
+    result = run_tablebank_eval.remote(
+        weights_path=weights,
+        dataset_root=dataset_root,
+        annotations_path=annotations,
+        output_dir=output_dir,
+        score_threshold=score_threshold,
+        duplicate_iou_threshold=duplicate_iou_threshold,
+        min_box_area=min_box_area,
+        unique_output_dir=unique_output_dir,
+        dataset_fraction=dataset_fraction,
+        sample_seed=sample_seed,
+        query_text=query_text,
+        batch_size=batch_size,
+        visualize_max_images=visualize_max_images,
+    )
     if show_current_leader_only:
         result = describe_current_leader.remote(
             study_name=study_name,
